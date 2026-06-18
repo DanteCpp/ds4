@@ -2180,6 +2180,114 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+/* Backend-agnostic expert-swap planner/threshold checks (no model needed). */
+static ds4_expert_swap_candidate es_make(int32_t id, float score,
+                                         bool activated, bool resident) {
+    ds4_expert_swap_candidate c = {0};
+    c.expert_id = id;
+    c.router_score = score;
+    c.router_prob = score;
+    c.activated = activated;
+    c.resident = resident;
+    return c;
+}
+
+static void test_expert_swap_worked_example(void) {
+    ds4_expert_swap_config cfg = {
+        .enabled = true,
+        .k = 12,
+        .min_prob_ratio = 0.5f,
+        .max_prob_drop = 0.0f,
+    };
+    ds4_expert_swap_candidate w[] = {
+        es_make(131, 0.91f, true,  true),   /* hit */
+        es_make(17,  0.85f, true,  true),   /* hit */
+        es_make(88,  0.74f, true,  false),  /* miss -> 240 */
+        es_make(205, 0.66f, true,  true),   /* hit */
+        es_make(42,  0.61f, true,  false),  /* miss -> 118 */
+        es_make(9,   0.55f, true,  false),  /* miss -> fetch */
+        es_make(240, 0.50f, false, true),   /* candidate */
+        es_make(53,  0.39f, false, false),
+        es_make(118, 0.34f, false, true),   /* candidate */
+        es_make(7,   0.28f, false, false),
+        es_make(196, 0.22f, false, true),   /* candidate */
+        es_make(61,  0.10f, false, false),
+    };
+    ds4_expert_swap_plan plan;
+    ds4_expert_swap_plan_layer(&plan, w, 12, 6, &cfg);
+
+    TEST_ASSERT(plan.n_used == 6);
+    TEST_ASSERT(plan.metrics.misses == 3);
+    TEST_ASSERT(plan.metrics.swaps == 2);
+    TEST_ASSERT(plan.metrics.fetches == 1);
+    TEST_ASSERT(plan.metrics.substituted_misses == 2);
+
+    const int32_t expect_run[6] = {131, 17, 240, 205, 118, 9};
+    for (int i = 0; i < 6; i++) {
+        TEST_ASSERT(plan.run_id[i] == expect_run[i]);
+    }
+    TEST_ASSERT(plan.kind[0] == DS4_EXPERT_SWAP_HIT);
+    TEST_ASSERT(plan.kind[2] == DS4_EXPERT_SWAP_SUBSTITUTE);
+    TEST_ASSERT(plan.kind[4] == DS4_EXPERT_SWAP_SUBSTITUTE);
+    TEST_ASSERT(plan.kind[5] == DS4_EXPERT_SWAP_FETCH);
+    TEST_ASSERT(plan.needs_fetch[5] && !plan.needs_fetch[2]);
+}
+
+static void test_expert_swap_degenerate(void) {
+    ds4_expert_swap_config cfg = {
+        .enabled = true,
+        .k = 8,
+        .min_prob_ratio = 0.5f,
+        .max_prob_drop = 0.0f,
+    };
+    ds4_expert_swap_candidate w[] = {
+        es_make(131, 0.91f, true,  true),
+        es_make(17,  0.85f, true,  false),  /* miss */
+        es_make(88,  0.74f, true,  false),  /* miss */
+        es_make(205, 0.66f, true,  true),
+        es_make(42,  0.61f, true,  false),  /* miss */
+        es_make(9,   0.55f, true,  true),
+        es_make(240, 0.50f, false, true),
+        es_make(118, 0.34f, false, true),
+    };
+    ds4_expert_swap_plan plan;
+
+    ds4_expert_swap_plan_layer(&plan, w, 6, 6, &cfg);
+    TEST_ASSERT(plan.metrics.swaps == 0);
+    TEST_ASSERT(plan.metrics.fetches == 3);
+}
+
+static void test_expert_swap_probability_gates(void) {
+    ds4_expert_swap_config cfg = {
+        .enabled = true,
+        .k = 4,
+        .min_prob_ratio = 0.5f,
+        .max_prob_drop = 0.0f,
+    };
+    ds4_expert_swap_candidate w[] = {
+        es_make(10, 0.90f, true,  false),  /* single miss */
+        es_make(20, 0.80f, true,  true),
+        es_make(50, 0.44f, false, true),   /* below min ratio */
+        es_make(40, 0.43f, false, true),
+    };
+    ds4_expert_swap_plan plan;
+    ds4_expert_swap_plan_layer(&plan, w, 4, 2, &cfg);
+    TEST_ASSERT(plan.metrics.swaps == 0);
+    TEST_ASSERT(plan.metrics.fetches == 1);
+
+    cfg.min_prob_ratio = 0.0f;
+    cfg.max_prob_drop = 0.60f;
+    ds4_expert_swap_plan_layer(&plan, w, 4, 2, &cfg);
+    TEST_ASSERT(plan.metrics.swaps == 0);
+    TEST_ASSERT(plan.metrics.fetches == 1);
+}
+
+static void test_expert_swap_group(void) {
+    test_expert_swap_worked_example();
+    test_expert_swap_degenerate();
+    test_expert_swap_probability_gates();
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2204,6 +2312,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--expert-swap", "expert-swap", "expert-swap planner, adaptive threshold, and scale-table unit tests", test_expert_swap_group},
 };
 
 static void test_print_help(const char *prog) {
