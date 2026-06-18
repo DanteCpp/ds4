@@ -35,16 +35,71 @@ static void strip_newline(char *s) {
     while (n && (s[n - 1] == '\n' || s[n - 1] == '\r')) s[--n] = '\0';
 }
 
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
+            "[--ssd-streaming] [--ssd-streaming-cache-experts N|NGB] "
+            "[--expert-swap [K]]\n",
+            prog);
+}
+
 int main(int argc, char **argv) {
-    if (argc != 4 && argc != 5) {
-        fprintf(stderr, "usage: %s MODEL manifest.tsv OUT.tsv [ctx]\n", argv[0]);
+    const char *positional[4] = {0};
+    int n_pos = 0;
+    bool ssd_streaming = false;
+    uint32_t cache_experts = 0;
+    uint64_t cache_bytes = 0;
+    bool expert_swap = false;
+    uint32_t expert_swap_k = 0;
+    float expert_swap_min_prob_ratio = 0.5f;
+    float expert_swap_max_prob_drop = 0.0f;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--ssd-streaming")) {
+            ssd_streaming = true;
+        } else if (!strcmp(a, "--ssd-streaming-cache-experts")) {
+            if (i + 1 >= argc ||
+                !ds4_parse_streaming_cache_experts_arg(argv[++i], &cache_experts,
+                                                       &cache_bytes)) {
+                die("--ssd-streaming-cache-experts needs a positive count or NGB");
+            }
+        } else if (!strcmp(a, "--expert-swap")) {
+            /* `--expert-swap [K]`.  K is optional; min_prob_ratio comes from
+             * DS4_EXPERT_SWAP_MIN_PROB_RATIO, matching every other ds4
+             * executable. */
+            const char *next1 = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *next2 = (i + 2 < argc) ? argv[i + 2] : NULL;
+            ds4_expert_swap_config es = {0};
+            int consumed = 0;
+            ds4_expert_swap_parse_args(next1, next2, &es, &consumed);
+            i += consumed;
+            expert_swap = true;
+            expert_swap_k = es.k;
+            expert_swap_min_prob_ratio = es.min_prob_ratio;
+            expert_swap_max_prob_drop = es.max_prob_drop;
+            ssd_streaming = true; /* --expert-swap implies --ssd-streaming */
+        } else if (a[0] == '-' && a[1] == '-') {
+            fprintf(stderr, "unknown option: %s\n", a);
+            usage(argv[0]);
+            return 2;
+        } else if (n_pos < 4) {
+            positional[n_pos++] = a;
+        } else {
+            usage(argv[0]);
+            return 2;
+        }
+    }
+
+    if (n_pos < 3) {
+        usage(argv[0]);
         return 2;
     }
 
-    const char *model_path = argv[1];
-    const char *manifest_path = argv[2];
-    const char *out_path = argv[3];
-    int ctx_size = argc == 5 ? atoi(argv[4]) : 4096;
+    const char *model_path = positional[0];
+    const char *manifest_path = positional[1];
+    const char *out_path = positional[2];
+    int ctx_size = positional[3] ? atoi(positional[3]) : 4096;
     if (ctx_size < 1024) ctx_size = 1024;
 
     ds4_engine_options opt = {
@@ -57,6 +112,13 @@ int main(int argc, char **argv) {
         .n_threads = 0,
         .warm_weights = false,
         .quality = false,
+        .ssd_streaming = ssd_streaming,
+        .ssd_streaming_cache_experts = cache_experts,
+        .ssd_streaming_cache_bytes = cache_bytes,
+        .expert_swap = expert_swap,
+        .expert_swap_k = expert_swap_k,
+        .expert_swap_min_prob_ratio = expert_swap_min_prob_ratio,
+        .expert_swap_max_prob_drop = expert_swap_max_prob_drop,
     };
 
     ds4_engine *engine = NULL;

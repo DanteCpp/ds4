@@ -245,15 +245,16 @@ and occasional work when you accept slow generation. Start with `--nothink`:
 
 On an M5 Max with 128GB of RAM, a short PRO q2 streaming decode benchmark found
 the automatic budget best: it selected about `59GB` of routed expert cache.
-Manual `64GB` to `75GB` caches were close on that machine. Larger explicit
-`NGB` requests are capped before inference so the expert buffers remain
-lockable instead of falling into macOS paging. If the system is under extra
-memory pressure and `mlock` still fails, ds4 refuses to install pageable
-expert-cache entries and releases a locked-cache margin before continuing with
-the measured lockable cache size. Prefer the automatic budget; if setting the
-cache manually on this class of machine, start around `48GB` to `64GB`, then
-increase only while the startup log reports a lockable cache. Once the machine
-is stable, re-enable thinking with a conservative generation limit:
+Manual `64GB` to `75GB` caches were close on that machine. Explicit `NGB`
+requests override the automatic safety margin and are capped only at the
+backend-reported working set, so you can intentionally spend all available
+working-set memory on routed experts. If the system is under extra memory
+pressure and `mlock` fails, ds4 refuses to install pageable expert-cache entries
+and releases a locked-cache margin before continuing with the measured lockable
+cache size. Prefer the automatic budget; if setting the cache manually on this
+class of machine, start around `48GB` to `64GB`, then increase only while the
+startup log reports a lockable cache. Once the machine is stable, re-enable
+thinking with a conservative generation limit:
 
 ```sh
 ./ds4 \
