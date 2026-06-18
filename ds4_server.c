@@ -11621,6 +11621,18 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--expert-swap")) {
+            const char *next1 = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *next2 = (i + 2 < argc) ? argv[i + 2] : NULL;
+            ds4_expert_swap_config es = {0};
+            int consumed = 0;
+            ds4_expert_swap_parse_args(next1, next2, &es, &consumed);
+            i += consumed;
+            c.engine.expert_swap = true;
+            c.engine.expert_swap_k = es.k;
+            c.engine.expert_swap_min_prob_ratio = es.min_prob_ratio;
+            c.engine.expert_swap_max_prob_drop = es.max_prob_drop;
+            c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {

@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "ds4_ssd.h"
+#include "ds4_expert_swap.h"
 
 /* Public engine boundary.
  *
@@ -107,6 +108,10 @@ typedef struct {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    bool expert_swap;
+    uint32_t expert_swap_k;
+    float expert_swap_min_prob_ratio;
+    float expert_swap_max_prob_drop;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;
@@ -272,6 +277,11 @@ int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
+/* Expert-swap integration seam.  A streaming backend reads back the ranked
+ * top-k router window plus its cache-residency snapshot, fills a
+ * ds4_expert_swap_candidate array, and calls ds4_expert_swap_plan_layer() with
+ * these.  Both return NULL / a neutral config when --expert-swap is inactive. */
+const ds4_expert_swap_config *ds4_engine_expert_swap_config(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);

@@ -41,6 +41,10 @@ typedef struct {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    bool expert_swap;
+    uint32_t expert_swap_k;
+    float expert_swap_min_prob_ratio;
+    float expert_swap_max_prob_drop;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
@@ -267,6 +271,18 @@ static bench_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--expert-swap")) {
+            const char *next1 = (i + 1 < argc) ? argv[i + 1] : NULL;
+            const char *next2 = (i + 2 < argc) ? argv[i + 2] : NULL;
+            ds4_expert_swap_config es = {0};
+            int consumed = 0;
+            ds4_expert_swap_parse_args(next1, next2, &es, &consumed);
+            i += consumed;
+            c.expert_swap = true;
+            c.expert_swap_k = es.k;
+            c.expert_swap_min_prob_ratio = es.min_prob_ratio;
+            c.expert_swap_max_prob_drop = es.max_prob_drop;
+            c.ssd_streaming = true;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.simulate_used_memory_bytes)) {
@@ -516,6 +532,10 @@ int main(int argc, char **argv) {
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
+        .expert_swap = cfg.expert_swap,
+        .expert_swap_k = cfg.expert_swap_k,
+        .expert_swap_min_prob_ratio = cfg.expert_swap_min_prob_ratio,
+        .expert_swap_max_prob_drop = cfg.expert_swap_max_prob_drop,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,

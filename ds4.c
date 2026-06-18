@@ -121,6 +121,7 @@ enum {
     DS4_MAX_LORA_O           = 1024,
     DS4_MAX_EXPERT           = 384,
     DS4_MAX_EXPERT_USED      = 6,
+    DS4_MAX_EXPERT_SWAP_K    = DS4_MAX_EXPERT,
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
@@ -3391,24 +3392,16 @@ static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
 }
 #endif
 
-static uint64_t ds4_streaming_manual_cache_safe_bytes(void) {
+static uint64_t ds4_streaming_cache_available_bytes(void) {
 #ifdef DS4_NO_GPU
     return 0;
 #else
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
-    const uint64_t recommended = ds4_gpu_recommended_working_set_size();
-    if (recommended == 0) return 0;
-
     /*
-     * Explicit NGB budgets name only the routed expert cache.  Keep that cache
-     * below the full Metal working-set recommendation so non-routed weights,
-     * scratch buffers, KV, and macOS wired-memory overhead do not force expert
-     * slots out of mlock during decode.
+     * Explicit NGB budgets are user overrides.  The auto planner keeps its own
+     * headroom; for manual cache sizes only cap at the backend-reported working
+     * set so users can intentionally spend all available memory on the cache.
      */
-    uint64_t safe = recommended > UINT64_MAX / 7ull ?
-        UINT64_MAX : (recommended * 7ull) / 10ull;
-    safe = (safe / gib) * gib;
-    return safe;
+    return ds4_gpu_recommended_working_set_size();
 #endif
 }
 
@@ -4367,6 +4360,21 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
     return model_map_span_vec_finish(spans);
 }
 
+static DS4_MAYBE_UNUSED bool weights_model_map_decode_fixed_spans(
+        const ds4_weights *w,
+        bool include_token,
+        bool include_output,
+        ds4_model_map_span_vec *spans) {
+    if (!w || !spans) return false;
+    memset(spans, 0, sizeof(*spans));
+    if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
+    }
+    if (include_output) model_map_span_vec_include_output(spans, w);
+    return model_map_span_vec_finish(spans);
+}
+
 static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
         const ds4_weights *w,
         uint32_t layer_start,
@@ -4406,8 +4414,15 @@ static DS4_MAYBE_UNUSED bool weights_streaming_non_routed_bytes(
     if (bytes_out) *bytes_out = 0;
     if (!w || !bytes_out) return false;
 
+    /*
+     * This is fixed resident pressure for the single-size-class expert cache.
+     * Off-slab routed layers (for example Q4 layers in a Q2/Q4 model) are served
+     * through mapped selected-expert views, but they should not consume the full
+     * cache byte budget up front: if they do not fit as a second class, the
+     * remaining memory is still useful for the Q2 slab.
+     */
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_decode_static_spans(w, true, true, &spans)) {
+    if (!weights_model_map_decode_fixed_spans(w, true, true, &spans)) {
         return false;
     }
     *bytes_out = model_map_span_vec_total_bytes(&spans);
@@ -10394,6 +10409,8 @@ typedef struct {
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
     ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *router_swap_selected;
+    ds4_gpu_tensor *router_swap_weights;
     ds4_gpu_tensor *routed_gate;
     ds4_gpu_tensor *routed_up;
     ds4_gpu_tensor *routed_mid;
@@ -10486,6 +10503,7 @@ typedef struct {
     double prefill_layer_avg_sec[DS4_MAX_LAYER];
     double decode_token_avg_sec;
     uint32_t streaming_preload_experts;
+    ds4_expert_swap_config expert_swap;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
@@ -10599,6 +10617,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->routed_up);
     ds4_gpu_tensor_free(g->routed_gate);
     ds4_gpu_tensor_free(g->router_weights);
+    ds4_gpu_tensor_free(g->router_swap_weights);
+    ds4_gpu_tensor_free(g->router_swap_selected);
     ds4_gpu_tensor_free(g->router_selected);
     ds4_gpu_tensor_free(g->router_probs);
     ds4_gpu_tensor_free(g->router_logits);
@@ -11136,6 +11156,8 @@ static bool metal_graph_alloc_raw_cap(
     g->router_probs = ds4_gpu_tensor_alloc(DS4_N_EXPERT * sizeof(float));
     g->router_selected = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int));
     g->router_weights = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+    g->router_swap_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_MAX_EXPERT_SWAP_K * sizeof(int32_t));
+    g->router_swap_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_MAX_EXPERT_SWAP_K * sizeof(float));
     g->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
@@ -14068,6 +14090,125 @@ static bool metal_graph_decode_set_hash_selected_override(
     return ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) != 0;
 }
 
+static bool metal_graph_expert_swap_substitution_enabled(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer) {
+    return g &&
+           layer &&
+           g->ssd_streaming &&
+           g->expert_swap.enabled &&
+           g->expert_swap.k > DS4_N_EXPERT_USED &&
+           g->expert_swap.min_prob_ratio > 0.0f &&
+           layer->ffn_gate_tid2eid == NULL;
+}
+
+static bool metal_graph_decode_apply_expert_swap(
+        ds4_gpu_graph           *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        uint32_t                 il,
+        uint32_t                 token,
+        uint64_t                 gate_expert_bytes,
+        uint64_t                 down_expert_bytes) {
+    if (!g || !model || !layer || !g->expert_swap.enabled ||
+        !g->ssd_streaming ||
+        !g->router_swap_selected || !g->router_swap_weights ||
+        !g->router_selected || !g->router_probs ||
+        DS4_N_EXPERT == 0 || DS4_N_EXPERT > DS4_MAX_EXPERT ||
+        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
+        return true;
+    }
+    if (!metal_graph_expert_swap_substitution_enabled(g, layer)) {
+        return true;
+    }
+
+    const uint32_t k = ds4_expert_swap_clamp_k(g->expert_swap.k,
+                                               DS4_N_EXPERT_USED,
+                                               DS4_N_EXPERT);
+    if (k <= DS4_N_EXPERT_USED || k > DS4_MAX_EXPERT_SWAP_K) return true;
+
+    if (!ds4_gpu_router_select_tensor(g->router_swap_selected,
+                                      g->router_swap_weights,
+                                      g->router_probs,
+                                      model->map,
+                                      model->size,
+                                      layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                      0,
+                                      0,
+                                      token,
+                                      DS4_N_EXPERT,
+                                      k,
+                                      DS4_EXPERT_WEIGHT_SCALE,
+                                      0,
+                                      0,
+                                      layer->ffn_exp_probs_b != NULL,
+                                      false,
+                                      g->router_logits)) {
+        return false;
+    }
+
+    if (ds4_gpu_end_commands() == 0) return false;
+
+    int32_t routed_ids[DS4_MAX_EXPERT_USED] = {0};
+    int32_t window_ids[DS4_MAX_EXPERT_SWAP_K] = {0};
+    float probs[DS4_MAX_EXPERT] = {0};
+    bool ok =
+        ds4_gpu_tensor_read(g->router_selected,
+                            0,
+                            routed_ids,
+                            (uint64_t)DS4_N_EXPERT_USED * sizeof(routed_ids[0])) != 0 &&
+        ds4_gpu_tensor_read(g->router_swap_selected,
+                            0,
+                            window_ids,
+                            (uint64_t)k * sizeof(window_ids[0])) != 0 &&
+        ds4_gpu_tensor_read(g->router_probs,
+                            0,
+                            probs,
+                            (uint64_t)DS4_N_EXPERT * sizeof(probs[0])) != 0;
+    if (!ok) goto done;
+
+    float window_scores[DS4_MAX_EXPERT_SWAP_K] = {0};
+    float window_probs[DS4_MAX_EXPERT_SWAP_K] = {0};
+    const float *bias = NULL;
+    if (layer->ffn_exp_probs_b) {
+        bias = (const float *)((const uint8_t *)model->map +
+                               layer->ffn_exp_probs_b->abs_offset);
+    }
+    for (uint32_t i = 0; i < k; i++) {
+        if (window_ids[i] < 0 || (uint32_t)window_ids[i] >= DS4_N_EXPERT) {
+            ok = false;
+            goto done;
+        }
+        const uint32_t expert = (uint32_t)window_ids[i];
+        window_probs[i] = probs[expert];
+        window_scores[i] = probs[expert] + (bias ? bias[expert] : 0.0f);
+    }
+
+    int32_t run_ids[DS4_MAX_EXPERT_USED] = {0};
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
+    ok = ds4_gpu_stream_expert_cache_plan_expert_swap(&table,
+                                                      routed_ids,
+                                                      window_ids,
+                                                      window_scores,
+                                                      window_probs,
+                                                      k,
+                                                      DS4_N_EXPERT_USED,
+                                                      &g->expert_swap,
+                                                      run_ids) != 0;
+    if (ok) {
+        ok = ds4_gpu_routed_moe_set_selected_override(run_ids,
+                                                      DS4_N_EXPERT_USED) != 0;
+    }
+done:
+    if (ds4_gpu_begin_commands() == 0) return false;
+    return ok;
+}
+
 static bool metal_graph_decode_cpu_router(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -15585,6 +15726,13 @@ static bool metal_graph_encode_decode_layer(
                                                                    layer->ffn_down_exps->bytes,
                                                                    g);
     }
+    if (ok) ok = metal_graph_decode_apply_expert_swap(g,
+                                                      model,
+                                                      layer,
+                                                      il,
+                                                      (uint32_t)token,
+                                                      gate_expert_bytes,
+                                                      down_expert_bytes);
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
@@ -15617,6 +15765,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_decode_cuda_selected_slots_expected(g, layer);
     const bool overlap_selected_shared =
         ok &&
+        !metal_graph_expert_swap_substitution_enabled(g, layer) &&
         !decode_stage_profile &&
         !metal_graph_decode_cpu_router_applicable(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
@@ -15632,6 +15781,7 @@ static bool metal_graph_encode_decode_layer(
     const bool selected_readahead_shared_delay =
         ok &&
         !overlap_selected_shared &&
+        !metal_graph_expert_swap_substitution_enabled(g, layer) &&
         !decode_stage_profile &&
         metal_graph_use_iq2_selected_readahead_shared_delay(g) &&
         metal_graph_decode_iq2_selected_slots_expected(g, layer) &&
@@ -15642,6 +15792,7 @@ static bool metal_graph_encode_decode_layer(
         ok &&
         !overlap_selected_shared &&
         !selected_readahead_shared_delay &&
+        !metal_graph_expert_swap_substitution_enabled(g, layer) &&
         g->ssd_streaming &&
         metal_graph_decode_cuda_selected_slots_expected(g, layer) &&
         layer->ffn_gate_tid2eid == NULL &&
@@ -19165,6 +19316,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                (uint32_t)routed_out_dim,
                                                g->batch_router_selected,
                                                g->batch_router_weights,
+                                               g->batch_router_probs,
+                                               &g->expert_swap,
+                                               layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                               layer->ffn_exp_probs_b != NULL,
                                                DS4_N_EXPERT,
                                                DS4_N_EXPERT_USED,
                                                DS4_SWIGLU_CLAMP_EXP,
@@ -21823,6 +21978,7 @@ struct ds4_engine {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    ds4_expert_swap_config expert_swap;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
     bool ssd_streaming;
@@ -24036,6 +24192,11 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     return 0;
 }
 
+const ds4_expert_swap_config *ds4_engine_expert_swap_config(ds4_engine *e) {
+    if (!e || !e->expert_swap.enabled) return NULL;
+    return &e->expert_swap;
+}
+
 bool ds4_engine_has_output_head(ds4_engine *e) {
     return e && weights_have_output_head(&e->weights);
 }
@@ -25411,7 +25572,7 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
         fprintf(stderr,
-                "ds4: SSD streaming auto cache could not measure routed expert size\n");
+                "ds4: SSD streaming auto cache could not measure routed slab expert size\n");
         return false;
     }
 
@@ -25441,7 +25602,7 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             "ds4:   non-routed weights: %.2f GiB\n",
             (double)non_routed_bytes / 1073741824.0);
     fprintf(stderr,
-            "ds4:   routed expert size: %.2f MiB\n",
+            "ds4:   routed slab expert size: %.2f MiB\n",
             (double)per_expert_bytes / 1048576.0);
     fprintf(stderr,
             "ds4:   cached expert count: %u (%.2f GiB)\n",
@@ -25543,6 +25704,54 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 #endif
 }
 
+/*
+ * Finalize the expert-swap feature once the streaming expert-cache budget is
+ * known: clamp k against the model shape, load the optional imatrix-derived
+ * adaptive scale sidecar (falling back to neutral scales), and report the
+ * resulting cache budget and adaptive status at startup.  No-op unless
+ * --expert-swap was requested.
+ */
+static void ds4_engine_configure_expert_swap(ds4_engine *e,
+                                              const ds4_engine_options *opt) {
+    if (!e || !e->expert_swap.enabled) return;
+    (void)opt;
+
+    e->expert_swap.k = ds4_expert_swap_clamp_k(e->expert_swap.k,
+                                               DS4_N_EXPERT_USED, DS4_N_EXPERT);
+
+    uint32_t routed_layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &e->weights.layer[il];
+        if (l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps) routed_layers++;
+    }
+    uint64_t per_expert_bytes = 0;
+    (void)ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes);
+    const uint64_t cache_bytes =
+        (uint64_t)e->ssd_streaming_cache_experts * per_expert_bytes;
+    const uint32_t per_layer =
+        routed_layers ? e->ssd_streaming_cache_experts / routed_layers : 0;
+
+    fprintf(stderr,
+            "ds4: expert-swap enabled: k=%u min_prob_ratio=%.4g "
+            "max_prob_drop=%.4g, expert cache %.2f GiB (%u experts, ~%u/layer)\n",
+            e->expert_swap.k,
+            (double)e->expert_swap.min_prob_ratio,
+            (double)e->expert_swap.max_prob_drop,
+            (double)cache_bytes / 1073741824.0,
+            e->ssd_streaming_cache_experts,
+            per_layer);
+    if (e->expert_swap.k <= DS4_N_EXPERT_USED) {
+        fprintf(stderr,
+                "ds4: expert-swap: k==n_expert_used, substitution disabled "
+                "(baseline routing)\n");
+    }
+    if (e->expert_swap.min_prob_ratio <= 0.0f) {
+        fprintf(stderr,
+                "ds4: expert-swap: min_prob_ratio<=0, substitution disabled "
+                "(baseline SSD streaming)\n");
+    }
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -25557,6 +25766,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
+    e->expert_swap.enabled = opt->expert_swap;
+    e->expert_swap.k = opt->expert_swap_k;
+    e->expert_swap.min_prob_ratio = opt->expert_swap_min_prob_ratio;
+    e->expert_swap.max_prob_drop = opt->expert_swap_max_prob_drop;
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
@@ -25637,14 +25850,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_output_optional);
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        const uint64_t safe_cache_bytes =
-            ds4_streaming_manual_cache_safe_bytes();
-        if (safe_cache_bytes != 0 &&
-            e->ssd_streaming_cache_bytes > safe_cache_bytes) {
-            e->ssd_streaming_cache_bytes = safe_cache_bytes;
+        const uint64_t available_cache_bytes =
+            ds4_streaming_cache_available_bytes();
+        if (available_cache_bytes != 0 &&
+            e->ssd_streaming_cache_bytes > available_cache_bytes) {
+            e->ssd_streaming_cache_bytes = available_cache_bytes;
             fprintf(stderr,
-                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
-                    "to keep expert buffers lockable\n",
+                    "ds4: %s SSD streaming cache budget %.2f GiB capped to "
+                    "backend available working set %.2f GiB\n",
                     ds4_backend_name(e->backend),
                     (double)requested_cache_bytes / 1073741824.0,
                     (double)e->ssd_streaming_cache_bytes / 1073741824.0);
@@ -25664,7 +25877,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         e->ssd_streaming_cache_experts = budget;
         fprintf(stderr,
-                "ds4: %s SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
+                "ds4: %s SSD streaming cache budget %.2f GiB / %.2f MiB slab expert = %u experts\n",
                 ds4_backend_name(e->backend),
                 (double)e->ssd_streaming_cache_bytes / 1073741824.0,
                 (double)per_expert_bytes / 1048576.0,
@@ -25729,6 +25942,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        ds4_engine_configure_expert_swap(e, opt);
         if (e->ssd_streaming) {
             /*
              * Pin the expert cache's slab size class to the model's uniform
@@ -26081,6 +26295,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming = e->ssd_streaming;
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
+    s->graph.expert_swap = e->expert_swap;
     s->graph.power_percent = (uint32_t)e->power_percent;
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
