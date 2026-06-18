@@ -4487,6 +4487,16 @@ typedef struct {
 
 typedef struct {
     uint32_t n_tokens;
+    uint32_t n_total_expert;
+    uint32_t n_selected;
+    uint32_t top_t;
+    float min_prob_ratio;
+    float max_prob_drop;
+    uint32_t has_bias;
+} ds4_gpu_dsv4_prefill_consolidate_args;
+
+typedef struct {
+    uint32_t n_tokens;
     uint32_t n_head;
     uint32_t n_raw;
     uint32_t raw_cap;
@@ -10615,6 +10625,16 @@ static int ds4_gpu_stream_expert_pending_load_matches(
     return 1;
 }
 
+/*
+ * EXPERT-SWAP INTEGRATION SEAM (see EXPERT_SWAP.md, "Execution model").
+ *
+ * This is where the streaming cache receives the activated expert ids before
+ * loading the missing ones from SSD.  The graph reads back a ranked top-k
+ * router window and biased scores, this function snapshots cache residency for
+ * those ids, and ds4_expert_swap_plan_layer() returns the six expert ids that
+ * should actually run.  The normal selected-override path then makes the MoE
+ * kernels and streaming loader consume those substituted ids.
+ */
 int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
@@ -10849,6 +10869,105 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     ds4_gpu_stream_expert_pending_load_release_buffers(p);
     p->n_tasks = 0;
     p->n_loads = 0;
+    return 1;
+}
+
+int ds4_gpu_stream_expert_cache_plan_expert_swap(
+        const ds4_gpu_stream_expert_table  *table,
+        const int32_t                      *routed_ids,
+        const int32_t                      *window_ids,
+        const float                        *window_scores,
+        const float                        *window_probs,
+        uint32_t                            n_window,
+        uint32_t                            n_selected,
+        const ds4_expert_swap_config       *config,
+        int32_t                            *out_run_ids) {
+    if (!out_run_ids || !routed_ids || n_selected == 0 || n_selected > 6) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < n_selected; i++) {
+        out_run_ids[i] = routed_ids[i];
+    }
+    if (!g_ssd_streaming_mode || !table || !window_ids || !window_scores ||
+        !window_probs ||
+        !config || !config->enabled ||
+        config->k <= n_selected || n_window <= n_selected) {
+        return 1;
+    }
+
+    const void *model_map = table->model_map;
+    const uint64_t model_size = table->model_size;
+    const uint32_t layer = table->layer;
+    const uint32_t n_total_expert = table->n_total_expert;
+    const uint64_t gate_offset = table->gate_offset;
+    const uint64_t up_offset = table->up_offset;
+    const uint64_t down_offset = table->down_offset;
+    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
+    const uint64_t down_expert_bytes = table->down_expert_bytes;
+    if (!model_map ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        n_total_expert == 0 ||
+        n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        !ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
+                                                      down_expert_bytes) ||
+        ds4_gpu_stream_expert_cache_effective_cap(layer,
+                                                  n_total_expert,
+                                                  n_selected) == 0) {
+        return 1;
+    }
+
+    ds4_expert_swap_candidate window[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    if (n_window > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        n_window = DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+    }
+    for (uint32_t i = 0; i < n_window; i++) {
+        const int32_t eid_i32 = window_ids[i];
+        if (eid_i32 < 0 || (uint32_t)eid_i32 >= n_total_expert) return 0;
+        const uint64_t expert_id = (uint64_t)(uint32_t)eid_i32;
+        if (expert_id > UINT64_MAX / gate_expert_bytes ||
+            expert_id > UINT64_MAX / down_expert_bytes) {
+            return 0;
+        }
+        const uint64_t gate_rel = expert_id * gate_expert_bytes;
+        const uint64_t down_rel = expert_id * down_expert_bytes;
+        if (gate_rel > UINT64_MAX - gate_offset ||
+            gate_rel > UINT64_MAX - up_offset ||
+            down_rel > UINT64_MAX - down_offset) {
+            return 0;
+        }
+        const uint64_t gate_abs = gate_offset + gate_rel;
+        const uint64_t up_abs = up_offset + gate_rel;
+        const uint64_t down_abs = down_offset + down_rel;
+        ds4_gpu_stream_expert_cache_entry *entry =
+            &g_stream_expert_cache[layer][(uint32_t)eid_i32];
+        const bool resident =
+            ds4_gpu_stream_expert_cache_entry_matches(entry,
+                                                      model_map,
+                                                      model_size,
+                                                      gate_abs,
+                                                      up_abs,
+                                                      down_abs,
+                                                      gate_expert_bytes,
+                                                      down_expert_bytes);
+        window[i] = (ds4_expert_swap_candidate) {
+            .expert_id = eid_i32,
+            .router_score = window_scores[i],
+            .router_prob = window_probs[i],
+            .activated = i < n_selected,
+            .resident = resident,
+        };
+    }
+
+    ds4_expert_swap_plan plan;
+    ds4_expert_swap_plan_layer(&plan,
+                               window,
+                               n_window,
+                               n_selected,
+                               config);
+    if (plan.n_used != n_selected) return 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        out_run_ids[i] = plan.run_id[i];
+    }
     return 1;
 }
 
@@ -11130,11 +11249,155 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
     g_stream_expert_cache_layer_count[layer] = 0;
 }
 
+static int ds4_gpu_stream_expert_prefill_consolidate_gpu(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t router_bias_offset,
+        bool has_router_bias,
+        ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *probs,
+        const ds4_expert_swap_config *config,
+        uint32_t n_tokens,
+        uint32_t n_total_expert,
+        uint32_t n_selected) {
+    if (!config || !config->enabled || config->k <= n_selected ||
+        config->min_prob_ratio <= 0.0f ||
+        !selected || !probs ||
+        n_tokens == 0 || n_selected == 0 || n_selected > 6 ||
+        n_total_expert == 0 ||
+        n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        return 1;
+    }
+
+    uint32_t top_t = config->k;
+    if (top_t > n_total_expert) top_t = n_total_expert;
+    if (top_t > 64) {
+        static bool warned_clamp;
+        if (!warned_clamp) {
+            warned_clamp = true;
+            fprintf(stderr,
+                    "ds4: expert-swap prefill window %u clamped to the "
+                    "kernel maximum of 64\n",
+                    top_t);
+        }
+        top_t = 64;
+    }
+    if (top_t <= n_selected) return 1;
+
+    id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+    id<MTLBuffer> probsbuf = ds4_gpu_tensor_buffer(probs);
+    if (!selectedbuf || !probsbuf ||
+        ds4_gpu_tensor_bytes(selected) < (uint64_t)n_tokens * n_selected * sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(probs) < (uint64_t)n_tokens * n_total_expert * sizeof(float)) {
+        return 0;
+    }
+
+    id<MTLComputePipelineState> freq_pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_prefill_expert_frequency");
+    id<MTLComputePipelineState> consolidate_pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_prefill_consolidate_selected");
+    if (!freq_pipeline || !consolidate_pipeline) return 0;
+
+    id<MTLBuffer> freqbuf =
+        ds4_gpu_new_transient_buffer((NSUInteger)n_total_expert * sizeof(uint32_t),
+                                     "ds4_prefill_expert_frequency");
+    id<MTLBuffer> statsbuf =
+        ds4_gpu_new_transient_buffer(2u * sizeof(uint32_t),
+                                     "ds4_prefill_consolidate_stats");
+    if (!freqbuf || !statsbuf) return 0;
+
+    id<MTLBuffer> biasbuf = probsbuf;
+    NSUInteger bias_inner = (NSUInteger)ds4_gpu_tensor_offset(probs);
+    uint32_t has_bias = 0;
+    if (has_router_bias) {
+        uint64_t inner = 0;
+        id<MTLBuffer> wrapped =
+            ds4_gpu_wrap_model_range(model_map,
+                                     model_size,
+                                     router_bias_offset,
+                                     (uint64_t)n_total_expert * sizeof(float),
+                                     &inner);
+        if (wrapped) {
+            biasbuf = wrapped;
+            bias_inner = (NSUInteger)inner;
+            has_bias = 1;
+        }
+    }
+
+    ds4_gpu_dsv4_prefill_consolidate_args args = {
+        .n_tokens = n_tokens,
+        .n_total_expert = n_total_expert,
+        .n_selected = n_selected,
+        .top_t = top_t,
+        .min_prob_ratio = config->min_prob_ratio,
+        .max_prob_drop = config->max_prob_drop,
+        .has_bias = has_bias,
+    };
+
+    id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+    if (!cb) return 0;
+
+    const NSUInteger n_ids = (NSUInteger)n_tokens * (NSUInteger)n_selected;
+    const NSUInteger freq_tg =
+        MIN((NSUInteger)freq_pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+    const NSUInteger consolidate_tg =
+        MIN((NSUInteger)consolidate_pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+
+    for (uint32_t round = 0; round < 2; round++) {
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return 0;
+        [blit fillBuffer:freqbuf
+                   range:NSMakeRange(0, (NSUInteger)n_total_expert * sizeof(uint32_t))
+                   value:0];
+        if (round == 0) {
+            [blit fillBuffer:statsbuf
+                       range:NSMakeRange(0, 2u * sizeof(uint32_t))
+                       value:0];
+        }
+        [blit endEncoding];
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:freq_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:selectedbuf
+                offset:(NSUInteger)ds4_gpu_tensor_offset(selected)
+               atIndex:1];
+        [enc setBuffer:freqbuf offset:0 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n_ids, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(freq_tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:consolidate_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:selectedbuf
+                offset:(NSUInteger)ds4_gpu_tensor_offset(selected)
+               atIndex:1];
+        [enc setBuffer:probsbuf
+                offset:(NSUInteger)ds4_gpu_tensor_offset(probs)
+               atIndex:2];
+        [enc setBuffer:freqbuf offset:0 atIndex:3];
+        [enc setBuffer:biasbuf offset:bias_inner atIndex:4];
+        [enc setBuffer:statsbuf offset:0 atIndex:5];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(consolidate_tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+    }
+
+    return ds4_gpu_finish_command_buffer(cb, 1, "prefill expert-swap consolidation");
+}
+
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const void    *model_map,
         uint64_t       model_size,
         uint32_t       layer,
         const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *probs,
+        const ds4_expert_swap_config *expert_swap,
+        uint64_t       router_bias_offset,
+        bool           has_router_bias,
         uint32_t       n_tokens,
         uint32_t       n_total_expert,
         uint32_t       n_selected,
@@ -11178,10 +11441,22 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     const bool profile =
         getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_PROFILE") != NULL;
     const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
-    int ok = ds4_gpu_tensor_read(selected,
+    int ok = ds4_gpu_stream_expert_prefill_consolidate_gpu(model_map,
+                                                           model_size,
+                                                           router_bias_offset,
+                                                           has_router_bias,
+                                                           (ds4_gpu_tensor *)selected,
+                                                           probs,
+                                                           expert_swap,
+                                                           n_tokens,
+                                                           n_total_expert,
+                                                           n_selected);
+    if (ok) {
+        ok = ds4_gpu_tensor_read(selected,
                                  0,
                                  ids,
                                  n_ids * sizeof(ids[0]));
+    }
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
 
     bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
@@ -24641,6 +24916,10 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *probs,
+        const ds4_expert_swap_config *expert_swap,
+        uint64_t                router_bias_offset,
+        bool                    has_router_bias,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
@@ -24984,6 +25263,10 @@ int ds4_gpu_routed_moe_batch_tensor(
                         model_size,
                         layer_index,
                         selected,
+                        probs,
+                        expert_swap,
+                        router_bias_offset,
+                        has_router_bias,
                         n_tokens,
                         n_total_expert,
                         n_expert,

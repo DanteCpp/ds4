@@ -344,3 +344,24 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(
     g_routed_moe_selected_override_n = n_selected;
     return 1;
 }
+
+extern "C" int ds4_gpu_stream_expert_cache_plan_expert_swap(
+        const ds4_gpu_stream_expert_table  *table,
+        const int32_t                      *routed_ids,
+        const int32_t                      *window_ids,
+        const float                        *window_scores,
+        const float                        *window_probs,
+        uint32_t                            n_window,
+        uint32_t                            n_selected,
+        const ds4_expert_swap_config       *config,
+        int32_t                            *out_run_ids) {
+    (void)table;
+    (void)window_ids;
+    (void)window_scores;
+    (void)window_probs;
+    (void)n_window;
+    (void)config;
+    if (!routed_ids || !out_run_ids) return 0;
+    for (uint32_t i = 0; i < n_selected; i++) out_run_ids[i] = routed_ids[i];
+    return 1;
+}

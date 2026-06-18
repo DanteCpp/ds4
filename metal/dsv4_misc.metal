@@ -89,6 +89,16 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t hash_rows;
 };
 
+struct ds4_metal_args_dsv4_prefill_consolidate {
+    uint32_t n_tokens;
+    uint32_t n_total_expert;
+    uint32_t n_selected;
+    uint32_t top_t;
+    float min_prob_ratio;
+    float max_prob_drop;
+    uint32_t has_bias;
+};
+
 struct ds4_metal_args_dsv4_directional_steering_project {
     uint32_t width;
     uint32_t rows;
@@ -96,6 +106,134 @@ struct ds4_metal_args_dsv4_directional_steering_project {
     uint32_t n_threads;
     float    scale;
 };
+
+kernel void kernel_dsv4_prefill_expert_frequency(
+        constant ds4_metal_args_dsv4_prefill_consolidate & args,
+        device const int32_t *selected,
+        device atomic_uint *freq,
+        uint tid [[thread_position_in_grid]]) {
+    const uint n_ids = args.n_tokens * args.n_selected;
+    if (tid >= n_ids) return;
+    const int32_t e = selected[tid];
+    if (e >= 0 && (uint32_t)e < args.n_total_expert) {
+        atomic_fetch_add_explicit(freq + (uint32_t)e, 1u, memory_order_relaxed);
+    }
+}
+
+static inline bool dsv4_prefill_prob_allowed(float cur_prob,
+                                             float cand_prob,
+                                             float min_prob_ratio,
+                                             float max_prob_drop) {
+    if (!(cand_prob >= 0.0f) || !(cur_prob >= 0.0f)) return false;
+    if (min_prob_ratio <= 0.0f) return false;
+    if (cand_prob >= cur_prob) return true;
+    if (min_prob_ratio > 0.0f && cand_prob < cur_prob * min_prob_ratio) return false;
+    if (max_prob_drop > 0.0f && cur_prob - cand_prob > max_prob_drop) return false;
+    return true;
+}
+
+static inline float dsv4_prefill_select_score(device const float *probs_row,
+                                              device const float *bias,
+                                              uint has_bias,
+                                              uint e) {
+    return has_bias != 0 ? probs_row[e] + bias[e] : probs_row[e];
+}
+
+static inline bool dsv4_prefill_score_better(device const float *probs_row,
+                                             device const float *bias,
+                                             uint has_bias,
+                                             uint a,
+                                             uint b) {
+    const float sa = dsv4_prefill_select_score(probs_row, bias, has_bias, a);
+    const float sb = dsv4_prefill_select_score(probs_row, bias, has_bias, b);
+    if (sa > sb) return true;
+    if (sa < sb) return false;
+    return a < b;
+}
+
+kernel void kernel_dsv4_prefill_consolidate_selected(
+        constant ds4_metal_args_dsv4_prefill_consolidate & args,
+        device int32_t *selected,
+        device const float *probs,
+        device atomic_uint *freq,
+        device const float *bias,
+        device atomic_uint *stats,
+        uint token [[thread_position_in_grid]]) {
+    if (token >= args.n_tokens ||
+        args.n_total_expert == 0 ||
+        args.n_selected == 0 ||
+        args.n_selected > 6 ||
+        args.top_t <= args.n_selected) {
+        return;
+    }
+
+    const uint n_total = args.n_total_expert;
+    const uint top_t = min(min(args.top_t, n_total), 64u);
+    device const float *probs_row = probs + (uint64_t)token * n_total;
+    device int32_t *sel = selected + (uint64_t)token * args.n_selected;
+
+    uint top_ids[64];
+    uint n_top = 0;
+    for (uint e = 0; e < n_total; e++) {
+        uint pos = 0;
+        while (pos < n_top &&
+               !dsv4_prefill_score_better(probs_row, bias, args.has_bias, e, top_ids[pos])) {
+            pos++;
+        }
+        if (pos >= top_t) continue;
+        if (n_top < top_t) n_top++;
+        for (uint j = n_top - 1u; j > pos; j--) {
+            top_ids[j] = top_ids[j - 1u];
+        }
+        top_ids[pos] = e;
+    }
+
+    for (uint s = 0; s < args.n_selected; s++) {
+        const int32_t cur_i = sel[s];
+        if (cur_i < 0 || (uint32_t)cur_i >= n_total) continue;
+        const uint cur = (uint)cur_i;
+        const uint cur_freq = atomic_load_explicit(freq + cur, memory_order_relaxed);
+
+        int best = -1;
+        uint best_freq = cur_freq;
+        float best_prob = -3.402823466e+38f;
+
+        for (uint k = 0; k < n_top; k++) {
+            const uint c = top_ids[k];
+            const uint c_freq = atomic_load_explicit(freq + c, memory_order_relaxed);
+            if (c_freq < best_freq) continue;
+            if (c_freq == best_freq) {
+                if (best < 0 || probs_row[c] <= best_prob) continue;
+            }
+            if (!dsv4_prefill_prob_allowed(probs_row[cur], probs_row[c],
+                                           args.min_prob_ratio,
+                                           args.max_prob_drop)) {
+                continue;
+            }
+            bool already = false;
+            for (uint j = 0; j < args.n_selected; j++) {
+                if (sel[j] == (int32_t)c) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            best = (int)c;
+            best_freq = c_freq;
+            best_prob = probs_row[c];
+        }
+        if (best >= 0) {
+            sel[s] = best;
+            atomic_fetch_add_explicit(stats + 0, 1u, memory_order_relaxed);
+            const float drop = probs_row[cur] - best_prob;
+            if (drop > 0.0f) {
+                atomic_fetch_add_explicit(stats + 1,
+                                          (uint)(drop * 1.0e4f),
+                                          memory_order_relaxed);
+            }
+        }
+    }
+}
 
 // Optional directional steering projection.
 //

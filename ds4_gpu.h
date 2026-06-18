@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4_expert_swap.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -99,6 +101,16 @@ int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+int ds4_gpu_stream_expert_cache_plan_expert_swap(
+        const ds4_gpu_stream_expert_table  *table,
+        const int32_t                      *routed_ids,
+        const int32_t                      *window_ids,
+        const float                        *window_scores,
+        const float                        *window_probs,
+        uint32_t                            n_window,
+        uint32_t                            n_selected,
+        const ds4_expert_swap_config       *config,
+        int32_t                            *out_run_ids);
 int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
@@ -861,6 +873,10 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *probs,
+        const ds4_expert_swap_config *expert_swap,
+        uint64_t                router_bias_offset,
+        bool                    has_router_bias,
         uint32_t                n_total_expert,
         uint32_t                n_expert,
         float                   clamp,
