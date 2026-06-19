@@ -13771,6 +13771,76 @@ static bool metal_graph_decode_iq2_selected_slots_expected(
            getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
 }
 
+static bool metal_graph_deterministic_hash_prefetch_enabled(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer,
+        uint32_t                 il) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && defined(__APPLE__)
+    return g &&
+           g->ssd_streaming &&
+           DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
+           il < DS4_N_HASH_LAYER &&
+           DS4_N_EXPERT == 256 &&
+           DS4_N_EXPERT_USED == 6 &&
+           layer &&
+           layer->ffn_gate_tid2eid &&
+           metal_graph_decode_iq2_selected_slots_expected(g, layer) &&
+           getenv("DS4_METAL_DISABLE_DETERMINISTIC_EXPERT_PREFETCH") == NULL;
+#else
+    (void)g;
+    (void)layer;
+    (void)il;
+    return false;
+#endif
+}
+
+static bool metal_graph_start_deterministic_hash_prefetch(
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_layer_weights  *layer,
+        uint32_t                  il,
+        int                       token) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!metal_graph_deterministic_hash_prefetch_enabled(g, layer, il)) {
+        return true;
+    }
+    if (!model || token < 0) return false;
+
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!streaming_layer_gate_down_expert_bytes(layer,
+                                                &gate_expert_bytes,
+                                                &down_expert_bytes)) {
+        return false;
+    }
+
+    int selected[DS4_MAX_EXPERT_USED];
+    int32_t selected_i32[DS4_MAX_EXPERT_USED];
+    layer_hash_selected_experts(selected, model, layer, token);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        selected_i32[i] = (int32_t)selected[i];
+    }
+
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
+    return ds4_gpu_stream_expert_cache_begin_transient_selected_load(
+                &table,
+                selected_i32,
+                DS4_N_EXPERT_USED) != 0;
+#else
+    (void)g;
+    (void)model;
+    (void)layer;
+    (void)il;
+    (void)token;
+    return true;
+#endif
+}
+
 static bool metal_graph_decode_cuda_selected_slots_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
@@ -14044,7 +14114,8 @@ static bool metal_graph_decode_set_hash_selected_override(
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
     }
-    if (g && g->ssd_streaming) {
+    if (g && g->ssd_streaming &&
+        !metal_graph_deterministic_hash_prefetch_enabled(g, layer, il)) {
         if (DS4_N_EXPERT == 0 ||
             gate_tensor_bytes % DS4_N_EXPERT != 0 ||
             down_tensor_bytes % DS4_N_EXPERT != 0) {
@@ -16977,6 +17048,12 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t split_after_layers = metal_graph_token_split_after_layers();
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = metal_graph_start_deterministic_hash_prefetch(g,
+                                                           model,
+                                                           &weights->layer[il],
+                                                           il,
+                                                           token);
+        if (!ok) break;
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -19332,6 +19409,12 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     }
     if (batch_static_decode) {
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            ok = metal_graph_start_deterministic_hash_prefetch(g,
+                                                               model,
+                                                               &weights->layer[il],
+                                                               il,
+                                                               token);
+            if (!ok) break;
             ok = metal_graph_encode_decode_layer(g,
                                                  model,
                                                  &weights->layer[il],
@@ -19395,6 +19478,13 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         bool encoded_layer = false;
+        if (ok) {
+            ok = metal_graph_start_deterministic_hash_prefetch(g,
+                                                               model,
+                                                               &weights->layer[il],
+                                                               il,
+                                                               token);
+        }
         if (ok) {
             ok = metal_graph_encode_decode_layer(g,
                                                  model,
