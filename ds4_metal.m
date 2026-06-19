@@ -212,6 +212,10 @@ static double g_stream_expert_cache_mlock_ms;
 static int g_stream_expert_cache_mlock_warned;
 static uint64_t g_stream_expert_cache_buffer_allocs;
 static uint64_t g_stream_expert_cache_buffer_reuses;
+static uint64_t g_stream_expert_transient_bytes;
+static uint64_t g_stream_expert_transient_peak_bytes;
+static uint64_t g_stream_expert_transient_allocs;
+static uint64_t g_stream_expert_transient_reuses;
 static uint64_t g_stream_expert_cache_decode_tokens;
 static uint64_t g_stream_expert_cache_hotness_decay_token;
 static uint64_t g_stream_expert_timing_selected_calls;
@@ -7718,6 +7722,7 @@ typedef struct {
     NSUInteger gate_inners[6];
     NSUInteger up_inners[6];
     NSUInteger down_inners[6];
+    uint32_t transient_pool_slots[6];
     ds4_gpu_stream_expert_pread_task tasks[18];
     double start_ms;
 } ds4_gpu_stream_expert_pending_load;
@@ -7725,6 +7730,8 @@ typedef struct {
 static ds4_gpu_stream_expert_pending_load g_stream_expert_pending_load;
 static int g_stream_expert_pending_load_transient;
 static int g_stream_expert_pending_load_async;
+static void ds4_gpu_stream_expert_pending_load_return_transient_slots(
+        ds4_gpu_stream_expert_pending_load *p);
 
 typedef struct {
     ds4_gpu_stream_expert_pread_task *tasks;
@@ -8278,6 +8285,104 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_transient_buffer(
     }
     buffer.label = label;
     return buffer;
+}
+
+#define DS4_METAL_STREAM_TRANSIENT_EXPERT_POOL_SLOTS 18
+
+typedef struct {
+    __strong id<MTLBuffer> buffer;
+    uint64_t bytes;
+    int busy;
+} ds4_gpu_stream_expert_transient_slot;
+
+static ds4_gpu_stream_expert_transient_slot
+    g_stream_expert_transient_pool[DS4_METAL_STREAM_TRANSIENT_EXPERT_POOL_SLOTS];
+static pthread_mutex_t g_stream_expert_transient_pool_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+
+static void ds4_gpu_stream_expert_transient_pool_mark_free(
+        uint32_t slot) {
+    if (slot >= DS4_METAL_STREAM_TRANSIENT_EXPERT_POOL_SLOTS) return;
+    pthread_mutex_lock(&g_stream_expert_transient_pool_mutex);
+    g_stream_expert_transient_pool[slot].busy = 0;
+    pthread_mutex_unlock(&g_stream_expert_transient_pool_mutex);
+}
+
+static int ds4_gpu_stream_expert_transient_pool_take(
+        uint64_t                 bytes,
+        __strong id<MTLBuffer>  *buffer,
+        uint32_t                *slot_out) {
+    if (!buffer || !slot_out || bytes == 0) return 0;
+    *buffer = nil;
+    *slot_out = UINT32_MAX;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        pthread_mutex_lock(&g_stream_expert_transient_pool_mutex);
+        uint32_t reusable = UINT32_MAX;
+        uint32_t empty = UINT32_MAX;
+        for (uint32_t i = 0;
+             i < DS4_METAL_STREAM_TRANSIENT_EXPERT_POOL_SLOTS;
+             i++) {
+            ds4_gpu_stream_expert_transient_slot *slot =
+                &g_stream_expert_transient_pool[i];
+            if (slot->busy) continue;
+            if (slot->buffer && slot->bytes >= bytes) {
+                reusable = i;
+                break;
+            }
+            if (!slot->buffer && empty == UINT32_MAX) empty = i;
+        }
+        const uint32_t chosen =
+            reusable != UINT32_MAX ? reusable : empty;
+        if (chosen != UINT32_MAX) {
+            ds4_gpu_stream_expert_transient_slot *slot =
+                &g_stream_expert_transient_pool[chosen];
+            if (!slot->buffer) {
+                pthread_mutex_unlock(&g_stream_expert_transient_pool_mutex);
+                id<MTLBuffer> new_buffer =
+                    ds4_gpu_stream_expert_alloc_transient_buffer(
+                            bytes,
+                            @"ds4_stream_transient_expert");
+                if (!new_buffer) return 0;
+                pthread_mutex_lock(&g_stream_expert_transient_pool_mutex);
+                if (!slot->buffer && !slot->busy) {
+                    slot->buffer = new_buffer;
+                    slot->bytes = bytes;
+                    if (g_stream_expert_transient_bytes >
+                        UINT64_MAX - bytes) {
+                        g_stream_expert_transient_bytes = UINT64_MAX;
+                    } else {
+                        g_stream_expert_transient_bytes += bytes;
+                    }
+                    if (g_stream_expert_transient_peak_bytes <
+                        g_stream_expert_transient_bytes) {
+                        g_stream_expert_transient_peak_bytes =
+                            g_stream_expert_transient_bytes;
+                    }
+                    g_stream_expert_transient_allocs++;
+                }
+            } else {
+                g_stream_expert_transient_reuses++;
+            }
+            if (slot->buffer && !slot->busy && slot->bytes >= bytes) {
+                slot->busy = 1;
+                *buffer = slot->buffer;
+                *slot_out = chosen;
+                pthread_mutex_unlock(&g_stream_expert_transient_pool_mutex);
+                return 1;
+            }
+        }
+        pthread_mutex_unlock(&g_stream_expert_transient_pool_mutex);
+
+        if (!ds4_gpu_wait_pending_command_buffers(
+                    "deterministic transient expert pool")) {
+            return 0;
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: Metal deterministic transient expert pool exhausted\n");
+    return 0;
 }
 
 static int ds4_gpu_stream_expert_combined_buffer_enabled(void) {
@@ -10497,6 +10602,7 @@ static int ds4_gpu_stream_expert_pending_load_profile_enabled(void) {
 static void ds4_gpu_stream_expert_pending_load_release_buffers(
         ds4_gpu_stream_expert_pending_load *p) {
     if (!p) return;
+    ds4_gpu_stream_expert_pending_load_return_transient_slots(p);
     for (uint32_t i = 0; i < 6; i++) {
         p->gate_bufs[i] = nil;
         p->up_bufs[i] = nil;
@@ -10504,6 +10610,7 @@ static void ds4_gpu_stream_expert_pending_load_release_buffers(
         p->gate_inners[i] = 0;
         p->up_inners[i] = 0;
         p->down_inners[i] = 0;
+        p->transient_pool_slots[i] = UINT32_MAX;
     }
 }
 
@@ -10590,21 +10697,40 @@ static int ds4_gpu_stream_expert_pending_load_install(
     return 1;
 }
 
-static int ds4_gpu_stream_expert_pending_load_retain_transient_until_complete(
+static void ds4_gpu_stream_expert_pending_load_return_transient_slots(
+        ds4_gpu_stream_expert_pending_load *p) {
+    if (!p) return;
+    for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
+        const uint32_t slot = p->transient_pool_slots[load_i];
+        if (slot == UINT32_MAX) continue;
+        ds4_gpu_stream_expert_transient_pool_mark_free(slot);
+        p->transient_pool_slots[load_i] = UINT32_MAX;
+    }
+}
+
+static int ds4_gpu_stream_expert_pending_load_release_transient_on_complete(
         ds4_gpu_stream_expert_pending_load *p) {
     if (!p || !g_batch_cb || p->n_loads == 0) return 0;
 
-    NSMutableArray<id<MTLBuffer>> *buffers =
-        [NSMutableArray arrayWithCapacity:p->n_loads];
+    uint32_t *slots = malloc((size_t)p->n_loads * sizeof(slots[0]));
+    if (!slots) return 0;
+    uint32_t n_slots = 0;
     for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
-        id<MTLBuffer> b = p->gate_bufs[load_i];
-        if (!b) continue;
-        [buffers addObject:b];
+        const uint32_t slot = p->transient_pool_slots[load_i];
+        if (slot == UINT32_MAX) continue;
+        slots[n_slots++] = slot;
+        p->transient_pool_slots[load_i] = UINT32_MAX;
     }
-    if ([buffers count] == 0) return 0;
+    if (n_slots == 0) {
+        free(slots);
+        return 0;
+    }
 
     [g_batch_cb addCompletedHandler:^(__unused id<MTLCommandBuffer> cb) {
-        (void)[buffers count];
+        for (uint32_t i = 0; i < n_slots; i++) {
+            ds4_gpu_stream_expert_transient_pool_mark_free(slots[i]);
+        }
+        free(slots);
     }];
     return 1;
 }
@@ -10682,8 +10808,8 @@ static int ds4_gpu_stream_expert_pending_load_finish_transient(
         down_offsets[i] = p->down_inners[load_i];
     }
 
-    const int retained_until_complete =
-        ds4_gpu_stream_expert_pending_load_retain_transient_until_complete(p);
+    const int release_on_complete =
+        ds4_gpu_stream_expert_pending_load_release_transient_on_complete(p);
     if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
         fprintf(stderr,
                 "ds4: Metal streaming expert transient-load finish layer=%u experts=%u tensors=%u bytes=%.2f GiB wall=%.3f ms\n",
@@ -10694,7 +10820,7 @@ static int ds4_gpu_stream_expert_pending_load_finish_transient(
                 elapsed_ms);
     }
 
-    if (retained_until_complete) {
+    if (release_on_complete) {
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
     }
     ds4_gpu_stream_expert_pending_load_reset();
@@ -10840,6 +10966,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         p->gate_inners[i] = 0;
         p->up_inners[i] = 0;
         p->down_inners[i] = 0;
+        p->transient_pool_slots[i] = UINT32_MAX;
     }
     memset(p->tasks, 0, sizeof(p->tasks));
 
@@ -11077,6 +11204,7 @@ int ds4_gpu_stream_expert_cache_begin_transient_selected_load(
         p->gate_inners[i] = 0;
         p->up_inners[i] = 0;
         p->down_inners[i] = 0;
+        p->transient_pool_slots[i] = UINT32_MAX;
     }
     memset(p->tasks, 0, sizeof(p->tasks));
 
@@ -11147,11 +11275,11 @@ int ds4_gpu_stream_expert_cache_begin_transient_selected_load(
         const uint64_t up_inner = gate_expert_bytes;
         const uint64_t down_inner = gate_expert_bytes * 2ull;
         const uint64_t combined_bytes = down_inner + down_expert_bytes;
-        id<MTLBuffer> combined =
-            ds4_gpu_stream_expert_alloc_transient_buffer(
-                    combined_bytes,
-                    @"ds4_stream_transient_expert");
-        if (!combined) {
+        id<MTLBuffer> combined = nil;
+        uint32_t pool_slot = UINT32_MAX;
+        if (!ds4_gpu_stream_expert_transient_pool_take(combined_bytes,
+                                                       &combined,
+                                                       &pool_slot)) {
             ds4_gpu_stream_expert_pending_load_release_buffers(p);
             return 0;
         }
@@ -11161,6 +11289,7 @@ int ds4_gpu_stream_expert_cache_begin_transient_selected_load(
         p->gate_inners[load_i] = 0;
         p->up_inners[load_i] = (NSUInteger)up_inner;
         p->down_inners[load_i] = (NSUInteger)down_inner;
+        p->transient_pool_slots[load_i] = pool_slot;
 
         uint8_t *base = (uint8_t *)[combined contents];
         if (!base) {
