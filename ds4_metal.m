@@ -8259,6 +8259,27 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_buffer(
     return buffer;
 }
 
+static id<MTLBuffer> ds4_gpu_stream_expert_alloc_transient_buffer(
+        uint64_t  len,
+        NSString *label) {
+    if (!g_device ||
+        len == 0 ||
+        len > (uint64_t)NSUIntegerMax) {
+        return nil;
+    }
+
+    id<MTLBuffer> buffer = [g_device newBufferWithLength:(NSUInteger)len
+                                                 options:MTLResourceStorageModeShared];
+    if (!buffer) {
+        fprintf(stderr,
+                "ds4: Metal streaming expert transient buffer allocation failed (%.2f MiB)\n",
+                ds4_gpu_mib(len));
+        return nil;
+    }
+    buffer.label = label;
+    return buffer;
+}
+
 static int ds4_gpu_stream_expert_combined_buffer_enabled(void) {
     return g_ssd_streaming_mode;
 }
@@ -10569,6 +10590,25 @@ static int ds4_gpu_stream_expert_pending_load_install(
     return 1;
 }
 
+static int ds4_gpu_stream_expert_pending_load_retain_transient_until_complete(
+        ds4_gpu_stream_expert_pending_load *p) {
+    if (!p || !g_batch_cb || p->n_loads == 0) return 0;
+
+    NSMutableArray<id<MTLBuffer>> *buffers =
+        [NSMutableArray arrayWithCapacity:p->n_loads];
+    for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
+        id<MTLBuffer> b = p->gate_bufs[load_i];
+        if (!b) continue;
+        [buffers addObject:b];
+    }
+    if ([buffers count] == 0) return 0;
+
+    [g_batch_cb addCompletedHandler:^(__unused id<MTLCommandBuffer> cb) {
+        (void)[buffers count];
+    }];
+    return 1;
+}
+
 static int ds4_gpu_stream_expert_pending_load_finish_transient(
         __unsafe_unretained id<MTLBuffer> gate_bufs[6],
         __unsafe_unretained id<MTLBuffer> up_bufs[6],
@@ -10642,6 +10682,8 @@ static int ds4_gpu_stream_expert_pending_load_finish_transient(
         down_offsets[i] = p->down_inners[load_i];
     }
 
+    const int retained_until_complete =
+        ds4_gpu_stream_expert_pending_load_retain_transient_until_complete(p);
     if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
         fprintf(stderr,
                 "ds4: Metal streaming expert transient-load finish layer=%u experts=%u tensors=%u bytes=%.2f GiB wall=%.3f ms\n",
@@ -10652,6 +10694,9 @@ static int ds4_gpu_stream_expert_pending_load_finish_transient(
                 elapsed_ms);
     }
 
+    if (retained_until_complete) {
+        ds4_gpu_stream_expert_pending_load_release_buffers(p);
+    }
     ds4_gpu_stream_expert_pending_load_reset();
     return 1;
 }
@@ -11103,8 +11148,9 @@ int ds4_gpu_stream_expert_cache_begin_transient_selected_load(
         const uint64_t down_inner = gate_expert_bytes * 2ull;
         const uint64_t combined_bytes = down_inner + down_expert_bytes;
         id<MTLBuffer> combined =
-            ds4_gpu_stream_expert_alloc_buffer(combined_bytes,
-                                               @"ds4_stream_transient_expert");
+            ds4_gpu_stream_expert_alloc_transient_buffer(
+                    combined_bytes,
+                    @"ds4_stream_transient_expert");
         if (!combined) {
             ds4_gpu_stream_expert_pending_load_release_buffers(p);
             return 0;
