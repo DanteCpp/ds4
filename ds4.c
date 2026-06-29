@@ -10494,6 +10494,14 @@ typedef struct {
     float *cpu_router_norm;
 } ds4_gpu_graph;
 
+static bool metal_graph_upload_token_embedding_hc(
+        const ds4_gpu_graph *g,
+        ds4_gpu_tensor      *out_hc,
+        const ds4_model     *model,
+        const ds4_weights   *weights,
+        int                  token,
+        uint32_t             n_hc);
+
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
     return g && g->power_percent > 0 && g->power_percent < 100;
 }
@@ -13086,7 +13094,7 @@ static bool metal_graph_stream_map_decode_static_all(
         const ds4_model   *model,
         const ds4_weights *weights) {
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_decode_static_spans(weights, true, true, &spans)) {
+    if (!weights_model_map_decode_static_spans(weights, false, true, &spans)) {
         fprintf(stderr, "ds4: Metal SSD streaming could not build static decode spans\n");
         return false;
     }
@@ -16654,14 +16662,12 @@ static int metal_graph_decode_test(
     g.quality = quality;
     g.materialize_ffn_out = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
-                                                 model->map,
-                                                 model->size,
-                                                 weights->token_embd->abs_offset,
-                                                 (uint32_t)weights->token_embd->dim[1],
-                                                 (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
+    if (ok) ok = metal_graph_upload_token_embedding_hc(&g,
+                                                       g.cur_hc,
+                                                       model,
+                                                       weights,
+                                                       token,
+                                                       DS4_N_HC);
     if (ok) ok = metal_graph_encode_decode_layer(&g,
                                                model,
                                                layer,
@@ -16815,14 +16821,12 @@ static int metal_graph_first_token_full_test(
         embed_token_f16(model, weights, token, plain);
         hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
         ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
+        if (ok) ok = metal_graph_upload_token_embedding_hc(&g,
+                                                           g.cur_hc,
+                                                           model,
+                                                           weights,
+                                                           token,
+                                                           DS4_N_HC);
         if (ok) ok = ds4_gpu_end_commands() != 0;
 
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -16864,14 +16868,12 @@ static int metal_graph_first_token_full_test(
         free(plain);
     } else {
         if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
-                                                     model->map,
-                                                     model->size,
-                                                     weights->token_embd->abs_offset,
-                                                     (uint32_t)weights->token_embd->dim[1],
-                                                     (uint32_t)token,
-                                                     DS4_N_EMBD,
-                                                     DS4_N_HC) != 0;
+        if (ok) ok = metal_graph_upload_token_embedding_hc(&g,
+                                                           g.cur_hc,
+                                                           model,
+                                                           weights,
+                                                           token,
+                                                           DS4_N_HC);
 
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
@@ -16958,14 +16960,13 @@ static bool metal_graph_encode_token_raw_swa(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
 
-    bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
-                                              model->map,
-                                              model->size,
-                                              weights->token_embd->abs_offset,
-                                              (uint32_t)weights->token_embd->dim[1],
-                                              (uint32_t)token,
-                                              DS4_N_EMBD,
-                                              DS4_N_HC) != 0;
+    bool ok = metal_graph_upload_token_embedding_hc(g,
+                                               g->cur_hc,
+                                               model,
+                                               weights,
+                                               token,
+                                               DS4_N_HC);
+    if (!ok) return false;
 
     /*
      * Start executing the prefix of the decode graph while the CPU is still
@@ -17133,10 +17134,162 @@ static bool metal_graph_upload_prompt_embeddings_hc_cpu(
     return ok;
 }
 
+static bool metal_graph_pread_full(int fd, void *dst, uint64_t size, uint64_t off) {
+    uint8_t *p = dst;
+    uint64_t done = 0;
+    while (done < size) {
+        const uint64_t rem = size - done;
+        const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
+        if (off + done > (uint64_t)LLONG_MAX) return false;
+        const ssize_t got = pread(fd, p + done, want, (off_t)(off + done));
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (got == 0) return false;
+        done += (uint64_t)got;
+    }
+    return true;
+}
+
+static void *metal_graph_locked_alloc(uint64_t bytes, bool *locked_out) {
+    if (locked_out) *locked_out = false;
+    if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return NULL;
+
+    const size_t page = (size_t)getpagesize();
+    void *ptr = NULL;
+    if (page != 0 && posix_memalign(&ptr, page, (size_t)bytes) != 0) {
+        ptr = NULL;
+    }
+    if (!ptr) ptr = xmalloc((size_t)bytes);
+
+    if (mlock(ptr, (size_t)bytes) == 0) {
+        if (locked_out) *locked_out = true;
+    }
+    return ptr;
+}
+
+static bool metal_graph_stream_read_embedding_rows_f16(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *tokens,
+        uint32_t           n_tokens,
+        void             **rows_out,
+        uint64_t          *bytes_out,
+        bool              *locked_out) {
+    if (rows_out) *rows_out = NULL;
+    if (bytes_out) *bytes_out = 0;
+    if (locked_out) *locked_out = false;
+    if (!model || !weights || !weights->token_embd || !tokens ||
+        n_tokens == 0 || model->fd < 0) {
+        return false;
+    }
+
+    const ds4_tensor *te = weights->token_embd;
+    const uint64_t n_embd = te->dim[0];
+    const uint64_t n_vocab = te->dim[1];
+    if (n_embd == 0 ||
+        n_embd > UINT64_MAX / sizeof(uint16_t) ||
+        (uint64_t)n_tokens > UINT64_MAX / (n_embd * sizeof(uint16_t))) {
+        return false;
+    }
+    const uint64_t row_bytes = n_embd * sizeof(uint16_t);
+    const uint64_t total_bytes = (uint64_t)n_tokens * row_bytes;
+    if (te->abs_offset > model->size || row_bytes > model->size - te->abs_offset) {
+        return false;
+    }
+
+    void *rows = metal_graph_locked_alloc(total_bytes, locked_out);
+    if (!rows) return false;
+
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        const int token = tokens[i];
+        if (token < 0 || (uint64_t)token >= n_vocab) {
+            if (locked_out && *locked_out) munlock(rows, (size_t)total_bytes);
+            free(rows);
+            return false;
+        }
+        const uint64_t token_off = (uint64_t)token * row_bytes;
+        if (token_off > model->size - te->abs_offset ||
+            row_bytes > model->size - te->abs_offset - token_off) {
+            if (locked_out && *locked_out) munlock(rows, (size_t)total_bytes);
+            free(rows);
+            return false;
+        }
+        if (!metal_graph_pread_full(model->fd,
+                                    (uint8_t *)rows + (uint64_t)i * row_bytes,
+                                    row_bytes,
+                                    te->abs_offset + token_off)) {
+            if (locked_out && *locked_out) munlock(rows, (size_t)total_bytes);
+            free(rows);
+            return false;
+        }
+    }
+
+    if (rows_out) *rows_out = rows;
+    if (bytes_out) *bytes_out = total_bytes;
+    return true;
+}
+
+static bool metal_graph_upload_streamed_embedding_rows_hc(
+        ds4_gpu_tensor   *out_hc,
+        const ds4_model    *model,
+        const ds4_weights  *weights,
+        const int          *tokens,
+        uint32_t            n_tokens,
+        uint32_t            n_hc) {
+    void *rows = NULL;
+    uint64_t bytes = 0;
+    bool locked = false;
+    if (!metal_graph_stream_read_embedding_rows_f16(model,
+                                                    weights,
+                                                    tokens,
+                                                    n_tokens,
+                                                    &rows,
+                                                    &bytes,
+                                                    &locked)) {
+        return false;
+    }
+    const bool ok = ds4_gpu_embed_f16_rows_hc_tensor(out_hc,
+                                                     rows,
+                                                     n_tokens,
+                                                     DS4_N_EMBD,
+                                                     n_hc) != 0;
+    if (locked) munlock(rows, (size_t)bytes);
+    free(rows);
+    return ok;
+}
+
+static bool metal_graph_upload_token_embedding_hc(
+        const ds4_gpu_graph *g,
+        ds4_gpu_tensor      *out_hc,
+        const ds4_model     *model,
+        const ds4_weights   *weights,
+        int                  token,
+        uint32_t             n_hc) {
+    if (g && g->ssd_streaming) {
+        return metal_graph_upload_streamed_embedding_rows_hc(out_hc,
+                                                             model,
+                                                             weights,
+                                                             &token,
+                                                             1,
+                                                             n_hc);
+    }
+    return ds4_gpu_embed_token_hc_tensor(out_hc,
+                                         model->map,
+                                         model->size,
+                                         weights->token_embd->abs_offset,
+                                         (uint32_t)weights->token_embd->dim[1],
+                                         (uint32_t)token,
+                                         DS4_N_EMBD,
+                                         n_hc) != 0;
+}
+
 /* Seed the batched HC state from token ids: every HC stream starts as the same
  * 4096-wide embedding.  Long prefill chunks use the Metal get-rows/repeat
  * kernel so the CPU does not build and upload a large [token, HC, dim] tensor. */
 static bool metal_graph_upload_prompt_embeddings_hc(
+        const ds4_gpu_graph *g,
         ds4_gpu_tensor   *out_hc,
         ds4_gpu_tensor   *tokens,
         const ds4_model    *model,
@@ -17145,6 +17298,15 @@ static bool metal_graph_upload_prompt_embeddings_hc(
         uint32_t            pos0,
         uint32_t            n_tokens) {
     if (pos0 > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - pos0) return false;
+
+    if (g && g->ssd_streaming) {
+        return metal_graph_upload_streamed_embedding_rows_hc(out_hc,
+                                                             model,
+                                                             weights,
+                                                             prompt->v + pos0,
+                                                             n_tokens,
+                                                             DS4_N_HC);
+    }
 
     uint32_t gpu_min = 512;
 #ifndef DS4_ROCM_BUILD
@@ -19321,14 +19483,12 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
-        ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
-                                           model->map,
-                                           model->size,
-                                           weights->token_embd->abs_offset,
-                                           (uint32_t)weights->token_embd->dim[1],
-                                           (uint32_t)token,
-                                           DS4_N_EMBD,
-                                           DS4_N_HC) != 0;
+        ok = metal_graph_upload_token_embedding_hc(g,
+                                                   g->cur_hc,
+                                                   model,
+                                                   weights,
+                                                   token,
+                                                   DS4_N_HC);
     }
     if (batch_static_decode) {
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -19944,14 +20104,12 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
     bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(g->mtp_embed,
-                                                  base_model->map,
-                                                  base_model->size,
-                                                  base_weights->token_embd->abs_offset,
-                                                  (uint32_t)base_weights->token_embd->dim[1],
-                                                  (uint32_t)token,
-                                                  DS4_N_EMBD,
-                                                  1) != 0;
+    if (ok) ok = metal_graph_upload_token_embedding_hc(g,
+                                                       g->mtp_embed,
+                                                       base_model,
+                                                       base_weights,
+                                                       token,
+                                                       1);
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
                                                   g->mtp_embed,
                                                   mtp_model->map,
@@ -20358,7 +20516,8 @@ static bool metal_graph_prefill_layer_major(
     double execute_s = 0.0;
 
     if (!split_commands) {
-        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+        ok = metal_graph_upload_prompt_embeddings_hc(g,
+                                                     g->batch_cur_hc,
                                                      g->prefill_tokens,
                                                      model,
                                                      weights,
@@ -20505,7 +20664,8 @@ static bool metal_graph_prefill_layer_major(
 #endif
 
     double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
-    ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+    ok = metal_graph_upload_prompt_embeddings_hc(g,
+                                                 g->batch_cur_hc,
                                                  g->prefill_tokens,
                                                  model,
                                                  weights,
@@ -21130,7 +21290,8 @@ static bool metal_graph_verify_suffix_tops(
     if (top_rows && !row_tops) return false;
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
-    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+    if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g,
+                                                         g->batch_cur_hc,
                                                          g->prefill_tokens,
                                                          model,
                                                          weights,
@@ -21234,22 +21395,18 @@ static bool metal_graph_verify_decode2_exact(
     ds4_gpu_tensor *next1 = metal_graph_tensor_row_view(g->batch_next_hc, 1, hc_dim);
     bool ok = cur0 && cur1 && next0 && next1;
 
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur0,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token0,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
-    if (ok) ok = ds4_gpu_embed_token_hc_tensor(cur1,
-                                                  model->map,
-                                                  model->size,
-                                                  weights->token_embd->abs_offset,
-                                                  (uint32_t)weights->token_embd->dim[1],
-                                                  (uint32_t)token1,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
+    if (ok) ok = metal_graph_upload_token_embedding_hc(g,
+                                                       cur0,
+                                                       model,
+                                                       weights,
+                                                       token0,
+                                                       DS4_N_HC);
+    if (ok) ok = metal_graph_upload_token_embedding_hc(g,
+                                                       cur1,
+                                                       model,
+                                                       weights,
+                                                       token1,
+                                                       DS4_N_HC);
 
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
@@ -25779,7 +25936,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                         &e->weights,
                         load_layer_start,
                         load_layer_end,
-                        true,
+                        false,
                         map_output,
                         &spans);
             } else {
@@ -25812,7 +25969,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     snprintf(load_end, sizeof(load_end), "%u", load_layer_end);
                 }
                 fprintf(stderr,
-                        "ds4: SSD streaming initial %s model map restricted to token + non-routed layers %u:%s (%u spans, %.2f GiB tensor span)\n",
+                        "ds4: SSD streaming initial %s model map restricted to non-routed layers %u:%s (%u spans, %.2f GiB tensor span)\n",
                         ds4_backend_name(e->backend),
                         load_layer_start,
                         load_end,
@@ -26465,14 +26622,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         if (ok && !input_hc) {
-            ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
-                                               e->model.map,
-                                               e->model.size,
-                                               e->weights.token_embd->abs_offset,
-                                               (uint32_t)e->weights.token_embd->dim[1],
-                                               (uint32_t)tokens[0],
-                                               DS4_N_EMBD,
-                                               DS4_N_HC) != 0;
+            ok = metal_graph_upload_token_embedding_hc(g,
+                                                       g->cur_hc,
+                                                       &e->model,
+                                                       &e->weights,
+                                                       tokens[0],
+                                                       DS4_N_HC);
         }
         const uint32_t raw_row = pos0 % g->raw_cap;
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
@@ -26573,7 +26728,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
     } else if (ok) {
-        ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
+        ok = metal_graph_upload_prompt_embeddings_hc(g,
+                                                     g->batch_cur_hc,
                                                      g->prefill_tokens,
                                                      &e->model,
                                                      &e->weights,
