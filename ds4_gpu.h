@@ -163,6 +163,13 @@ int ds4_gpu_embed_tokens_hc_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_embed_f16_rows_hc_tensor(
+        ds4_gpu_tensor *out_hc,
+        const void     *rows_f16,
+        uint32_t        n_tokens,
+        uint32_t        n_embd,
+        uint32_t        n_hc);
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

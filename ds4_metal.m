@@ -157,6 +157,7 @@ static id<MTLBuffer> g_compressor_pool_product_buffer;
 static id<MTLBuffer> g_compressor_store_ape_buffer;
 static id<MTLBuffer> g_compressor_store_score_buffer;
 static id<MTLBuffer> g_embed_rows_buffer;
+static id<MTLBuffer> g_embed_f16_rows_buffer;
 static id<MTLBuffer> g_router_selection_buffer;
 static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
@@ -307,6 +308,7 @@ static NSUInteger g_compressor_pool_product_bytes;
 static NSUInteger g_compressor_store_ape_bytes;
 static NSUInteger g_compressor_store_score_bytes;
 static NSUInteger g_embed_rows_bytes;
+static NSUInteger g_embed_f16_rows_bytes;
 static NSUInteger g_router_selection_bytes;
 static NSUInteger g_router_weight_sum_bytes;
 static NSUInteger g_indexer_head_scores_bytes;
@@ -6807,6 +6809,7 @@ void ds4_gpu_cleanup(void) {
         g_compressor_store_ape_buffer = nil;
         g_compressor_store_score_buffer = nil;
         g_embed_rows_buffer = nil;
+        g_embed_f16_rows_buffer = nil;
         g_router_selection_buffer = nil;
         g_router_weight_sum_buffer = nil;
         g_indexer_head_scores_buffer = nil;
@@ -6843,6 +6846,7 @@ void ds4_gpu_cleanup(void) {
         g_compressor_store_ape_bytes = 0;
         g_compressor_store_score_bytes = 0;
         g_embed_rows_bytes = 0;
+        g_embed_f16_rows_bytes = 0;
         g_router_selection_bytes = 0;
         g_router_weight_sum_bytes = 0;
         g_indexer_head_scores_bytes = 0;
@@ -7144,6 +7148,81 @@ int ds4_gpu_embed_tokens_hc_tensor(
         }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "graph embed tokens")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_embed_f16_rows_hc_tensor(
+        ds4_gpu_tensor *out_hc,
+        const void     *rows_f16,
+        uint32_t        n_tokens,
+        uint32_t        n_embd,
+        uint32_t        n_hc) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_hc || (!rows_f16 && n_tokens != 0) ||
+        n_tokens == 0 || n_embd == 0 || n_hc == 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_hc);
+        const uint64_t out_bytes = (uint64_t)n_tokens * n_embd * n_hc * sizeof(float);
+        if (!outbuf || ds4_gpu_tensor_bytes(out_hc) < out_bytes) {
+            fprintf(stderr, "ds4: Metal streamed embedding received undersized HC output buffer\n");
+            return 0;
+        }
+
+        const uint64_t src_bytes64 = (uint64_t)n_tokens * n_embd * sizeof(uint16_t);
+        const uint64_t rows_bytes64 = (uint64_t)n_tokens * n_embd * sizeof(float);
+        if (src_bytes64 > (uint64_t)NSUIntegerMax || rows_bytes64 > (uint64_t)NSUIntegerMax) {
+            fprintf(stderr, "ds4: Metal streamed embedding row buffer is too large\n");
+            return 0;
+        }
+        const NSUInteger src_bytes = (NSUInteger)src_bytes64;
+        const NSUInteger rows_bytes = (NSUInteger)rows_bytes64;
+
+        if (!ds4_gpu_ensure_scratch_buffer(&g_embed_f16_rows_buffer,
+                                           &g_embed_f16_rows_bytes,
+                                           src_bytes,
+                                           "ds4_embed_f16_rows") ||
+            !ds4_gpu_ensure_scratch_buffer(&g_embed_rows_buffer,
+                                           &g_embed_rows_bytes,
+                                           rows_bytes,
+                                           "ds4_embed_rows")) {
+            return 0;
+        }
+        if (src_bytes != 0) {
+            memcpy([g_embed_f16_rows_buffer contents], rows_f16, src_bytes);
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        const uint64_t n_values = (uint64_t)n_tokens * n_embd;
+        if (n_values > UINT32_MAX) {
+            fprintf(stderr, "ds4: Metal streamed embedding has too many values\n");
+            return 0;
+        }
+        if (!ds4_gpu_encode_cpy_f16_f32_1d(cb,
+                                           g_embed_f16_rows_buffer,
+                                           0,
+                                           g_embed_rows_buffer,
+                                           0,
+                                           (uint32_t)n_values) ||
+            !ds4_gpu_encode_repeat_hc_embedding(cb,
+                                                g_embed_rows_buffer,
+                                                0,
+                                                outbuf,
+                                                ds4_gpu_tensor_offset(out_hc),
+                                                n_tokens,
+                                                n_embd,
+                                                n_hc)) {
+            return 0;
+        }
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "graph streamed embed rows")) return 0;
     }
 
     return 1;
