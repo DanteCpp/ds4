@@ -13103,6 +13103,31 @@ static bool metal_graph_stream_map_decode_static_all(
     return ok;
 }
 
+/* Distributed layer-slice counterpart of the static decode map: one view set
+ * covering every decode-static tensor the slice owns, plus the output head
+ * when this process loaded it. The map content is fixed per process, so it is
+ * installed once and kept current across worker requests instead of being
+ * rebuilt per layer per token. */
+static bool metal_graph_stream_map_decode_static_slice(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           layer_start,
+        uint32_t           layer_end) {
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_decode_static_slice_spans(weights,
+                                                     layer_start,
+                                                     layer_end,
+                                                     false,
+                                                     weights_have_output_head(weights),
+                                                     &spans)) {
+        fprintf(stderr, "ds4: Metal SSD streaming could not build static decode slice spans\n");
+        return false;
+    }
+    const bool ok = metal_graph_install_model_spans(model, &spans, "static decode slice");
+    free(spans.v);
+    return ok;
+}
+
 static bool metal_graph_stream_map_layer(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -26797,12 +26822,40 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
+        /* Mirror the solo streaming decode path (metal_graph_eval_token_raw_swa_streaming):
+         * keep one static view set that covers the whole slice and encode every
+         * layer into a single command buffer. The routed experts are served by
+         * the streaming cache, so nothing here depends on the current layer;
+         * the old per-layer map/begin/end cycle rebuilt the Metal model views
+         * for every layer of every token and serialized each SSD miss behind a
+         * full GPU round trip. */
+        const bool static_decode_map =
+            g->ssd_streaming && metal_graph_stream_decode_static_map_enabled();
+        const bool static_map_state_cache =
+            static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
+        const bool batch_static_decode =
+            static_decode_map && metal_graph_stream_decode_layer_batch_enabled(g);
         bool ok = true;
-        if (g->ssd_streaming && !input_hc) {
+        if (static_decode_map) {
+            if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
+                ok = metal_graph_stream_map_decode_static_slice(&e->model,
+                                                                &e->weights,
+                                                                layer_start,
+                                                                layer_end);
+                if (ok) g->streaming_static_decode_map_current = static_map_state_cache;
+            }
+        } else if (g->ssd_streaming) {
             g->streaming_static_decode_map_current = false;
-            ok = metal_graph_stream_map_token(&e->model, &e->weights);
+            if (!input_hc) ok = metal_graph_stream_map_token(&e->model, &e->weights);
+            if (ok) metal_graph_stream_readahead_layer_decode(&e->model, &e->weights, layer_start);
         }
-        if (input_hc) {
+        if (ok && g->ssd_streaming && layer_start == 0) {
+            ok = metal_graph_start_layer0_hash_cache_load(g,
+                                                          &e->model,
+                                                          &e->weights,
+                                                          tokens[0]);
+        }
+        if (ok && input_hc) {
             ok = ds4_gpu_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -26818,12 +26871,26 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, 1);
         const uint32_t split_after_layers = metal_graph_token_split_after_layers();
         uint32_t encoded_layers = 0;
-        if (g->ssd_streaming) {
+        if (g->ssd_streaming && !batch_static_decode) {
             if (ok) ok = ds4_gpu_end_commands() != 0;
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
-                g->streaming_static_decode_map_current = false;
-                ok = metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
+                if (!static_decode_map) {
+                    g->streaming_static_decode_map_current = false;
+                    ok = metal_graph_stream_map_layer_decode(&e->model, &e->weights, il);
+                    if (ok && il < layer_end) {
+                        metal_graph_stream_readahead_layer_decode(&e->model, &e->weights, il + 1);
+                    } else if (ok && output_logits) {
+                        metal_graph_stream_readahead_output(&e->model, &e->weights);
+                    }
+                }
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) {
+                    ok = metal_graph_start_deterministic_hash_prefetch(g,
+                                                                       &e->model,
+                                                                       &e->weights.layer[il],
+                                                                       il,
+                                                                       tokens[0]);
+                }
                 if (ok) {
                     ok = metal_graph_encode_decode_layer(g,
                                                          &e->model,
@@ -26842,14 +26909,24 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
             if (ok && output_logits) {
-                g->streaming_static_decode_map_current = false;
-                ok = metal_graph_stream_map_output(&e->model, &e->weights);
+                if (!static_decode_map) {
+                    g->streaming_static_decode_map_current = false;
+                    ok = metal_graph_stream_map_output(&e->model, &e->weights);
+                }
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
                 if (ok) ok = metal_graph_encode_output_head(g, &e->model, &e->weights, e->weights.output->dim[1]);
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
         } else {
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+                if (g->ssd_streaming) {
+                    ok = metal_graph_start_deterministic_hash_prefetch(g,
+                                                                       &e->model,
+                                                                       &e->weights.layer[il],
+                                                                       il,
+                                                                       tokens[0]);
+                    if (!ok) break;
+                }
                 ok = metal_graph_encode_decode_layer(g,
                                                      &e->model,
                                                      &e->weights.layer[il],
@@ -26865,6 +26942,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 g->after_ffn_hc = tmp;
                 encoded_layers++;
                 if (ok &&
+                    !g->ssd_streaming &&
                     split_after_layers != 0 &&
                     encoded_layers == split_after_layers &&
                     il < layer_end)
