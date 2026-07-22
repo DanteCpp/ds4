@@ -599,6 +599,42 @@ static ds4_gpu_stream_expert_cache_entry
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+
+/* =====================================================================
+ * Offload expert cache — a SEPARATE cache from the SSD-streaming cache above.
+ * Holds a partition of routed experts (coordinator: hot ~64%, worker: cold
+ * ~36%; union = 100%) in mlock'd Metal slab slots, populated from the GGUF
+ * (pread) at startup and updated by background LRU swaps (plan §6). The offload
+ * compute reads resident experts from these slots via the same slots6 Metal
+ * kernels the streaming path uses (kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32
+ * + the q2_K down-sum kernel) — no new GPU kernels, just a CPU-side encoder
+ * setup pointed at these slabs. See DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md.
+ * ===================================================================== */
+typedef struct {
+    __strong id<MTLBuffer> gate_buffer;
+    __strong id<MTLBuffer> up_buffer;
+    __strong id<MTLBuffer> down_buffer;
+    NSUInteger gate_inner;
+    NSUInteger up_inner;
+    NSUInteger down_inner;
+    uint32_t slab_slot;
+    uint64_t last_used;
+    uint8_t valid;
+} ds4_gpu_offload_expert_entry;
+
+static ds4_gpu_offload_expert_entry
+    g_offload_expert_cache[DS4_OFFLOAD_N_LAYER][DS4_OFFLOAD_N_ROUTED];
+static id<MTLBuffer> g_offload_expert_cache_slabs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+static uint32_t g_offload_expert_cache_slab_slot_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+static uint32_t g_offload_expert_cache_slab_slots_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+static uint32_t g_offload_expert_cache_slab_count;
+static uint64_t g_offload_expert_cache_slab_slot_bytes;
+static uint64_t g_offload_expert_cache_expert_bytes; /* gate+up+down per expert */
+static uint32_t g_offload_expert_cache_budget;        /* max resident experts */
+static uint32_t g_offload_expert_cache_resident;
+static bool     g_offload_expert_cache_active;
+static uint64_t g_offload_expert_cache_hits;
+static uint64_t g_offload_expert_cache_misses;
 static uint64_t g_stream_expert_cache_layer_hits[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_misses[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_evictions[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
