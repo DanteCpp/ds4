@@ -150,6 +150,36 @@ static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
                 DS4_OFFLOAD_N_EMBD, DS4_OFFLOAD_N_LAYER);
         return 2;
     }
+    /* Optionally pre-populate the mlock'd offload expert cache from the GGUF.
+     * Bounded by DS4_OFFLOAD_CACHE_EXPERTS (0 / unset = disabled, compute reads
+     * straight from the mmap). This is the OOM-safety knob, mirroring
+     * --ssd-streaming-cache-experts. A populate failure is non-fatal: the worker
+     * keeps serving via the direct-mmap compute. */
+    {
+        const char *ce = getenv("DS4_OFFLOAD_CACHE_EXPERTS");
+        uint32_t budget = 0;
+        if (ce && ce[0]) {
+            char *end = NULL;
+            long v = strtol(ce, &end, 10);
+            if (end != ce && *end == '\0' && v > 0) budget = (uint32_t)v;
+        }
+        if (budget) {
+            char perr[256] = "";
+            int n = ds4_engine_offload_populate_cache(engine, budget,
+                                                      perr, sizeof(perr));
+            if (n < 0) {
+                fprintf(stderr,
+                        "ds4: expert-server: offload cache populate failed: %s "
+                        "(serving via direct-mmap compute)\n",
+                        perr[0] ? perr : "unknown error");
+            } else {
+                fprintf(stderr,
+                        "ds4: expert-server: offload cache populated %d experts\n",
+                        n);
+            }
+        }
+    }
+
     ds4_offload_worker_options opt = {0};
     opt.bind_host = cfg->offload.bind;
     opt.port = cfg->offload.port;

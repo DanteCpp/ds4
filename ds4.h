@@ -258,6 +258,13 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
                                        const float *weights, int k,
                                        const uint16_t *hidden_f16,
                                        uint16_t *out_f16);
+/* Populate the mlock'd offload expert cache from the GGUF (pread) for up to
+ * `budget_experts` routed experts, in (layer, expert) order. Startup one-shot;
+ * the offload compute reads these resident slots. Returns the number of experts
+ * installed, or -1 on error (message in err). budget_experts == 0 is a no-op.
+ * Metal only. */
+int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
+                                      char *err, size_t errlen);
 /* Unit B self-test (EXPERT_OFFLOAD_HANDOFF.md Step 1): after generation, replay
  * the captured decode routed-MoE inputs through the offload expert compute in a
  * clean Metal state and diff against the captured routed_out. No-op unless

@@ -56354,6 +56354,77 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
             expert_ids, weights, k, hidden_f16, out_f16);
 }
 
+int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
+                                      char *err, size_t errlen) {
+#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+    (void)e; (void)budget_experts;
+    if (err) snprintf(err, errlen, "offload expert cache requires the Metal backend");
+    return -1;
+#else
+    if (!e) {
+        if (err) snprintf(err, errlen, "offload populate: null engine");
+        return -1;
+    }
+    if (budget_experts == 0) return 0;
+
+    const int n_layer = ds4_engine_layer_count(e);
+    if (n_layer <= 0 || n_layer > DS4_OFFLOAD_N_LAYER) {
+        if (err) snprintf(err, errlen,
+                          "offload populate: unexpected layer count %d", n_layer);
+        return -1;
+    }
+
+    /* Slot layout is uniform across layers; size it from layer 0 and configure. */
+    uint64_t gate_expert_bytes = 0, down_expert_bytes = 0;
+    if (!streaming_layer_gate_down_expert_bytes(&e->weights.layer[0],
+                                                &gate_expert_bytes,
+                                                &down_expert_bytes)) {
+        if (err) snprintf(err, errlen, "offload populate: cannot size layer-0 experts");
+        return -1;
+    }
+    if (ds4_gpu_offload_cache_configure(gate_expert_bytes, down_expert_bytes,
+                                        budget_experts, err, errlen) != 0) {
+        return -1;
+    }
+
+    uint32_t installed = 0;
+    for (int layer = 0; layer < n_layer && installed < budget_experts; layer++) {
+        const ds4_layer_weights *l = &e->weights.layer[layer];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
+            if (err) snprintf(err, errlen,
+                              "offload populate: layer %d missing expert tensors", layer);
+            return -1;
+        }
+        uint64_t g_bytes = 0, d_bytes = 0;
+        if (!streaming_layer_gate_down_expert_bytes(l, &g_bytes, &d_bytes)) {
+            if (err) snprintf(err, errlen,
+                              "offload populate: cannot size layer %d experts", layer);
+            return -1;
+        }
+        const uint64_t gate_off = l->ffn_gate_exps->abs_offset;
+        const uint64_t up_off   = l->ffn_up_exps->abs_offset;
+        const uint64_t down_off = l->ffn_down_exps->abs_offset;
+        for (int x = 0; x < (int)DS4_N_EXPERT && installed < budget_experts; x++) {
+            if ((uint64_t)x > UINT64_MAX / g_bytes ||
+                (uint64_t)x > UINT64_MAX / d_bytes) {
+                if (err) snprintf(err, errlen, "offload populate: offset overflow");
+                return -1;
+            }
+            const int rc = ds4_gpu_offload_cache_install_expert(
+                    layer, x,
+                    gate_off + (uint64_t)x * g_bytes,
+                    up_off   + (uint64_t)x * g_bytes,
+                    down_off + (uint64_t)x * d_bytes,
+                    g_bytes, d_bytes, err, errlen);
+            if (rc < 0) return -1;
+            if (rc == 0) installed++;
+            else break; /* rc == 1: budget full, stop */
+        }
+    }
+    return (int)installed;
+#endif
+}
+
 uint64_t ds4_engine_model_bytes(ds4_engine *e) {
     return e->model.size;
 }

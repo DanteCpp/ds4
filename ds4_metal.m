@@ -11593,6 +11593,267 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
                                                    down_inner);
 }
 
+/* =====================================================================
+ * Offload expert cache populate (GGUF pread -> mlock'd Metal slabs).
+ *
+ * Separate from the SSD-streaming cache. A startup one-shot fill: the node
+ * preads the gate/up/down weights of the routed experts it owns into mlock'd
+ * slab slots, laid out gate | up | down contiguous per slot exactly like the
+ * streaming slabs, so the offload compute can bind these slots to the same
+ * slots6 Metal kernels. No eviction here (Phase-2 LRU swaps come later).
+ * ===================================================================== */
+static uint64_t ds4_gpu_offload_cache_slab_target_bytes(void) {
+    const uint64_t mib = 1024ull * 1024ull;
+    uint64_t target = 8192ull * mib; /* 8 GiB per slab, halved on alloc failure */
+    const char *env = getenv("DS4_OFFLOAD_CACHE_SLAB_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && *end == '\0' && v != 0) {
+            target = v > UINT64_MAX / mib ? UINT64_MAX : (uint64_t)v * mib;
+        }
+    }
+    return target;
+}
+
+/* Hand out one slot of `slot_bytes`, growing the slab set (and mlock'ing each
+ * new slab) as needed. Returns the backing buffer and the slot's byte base
+ * within it, or nil when the budget / slab limit is reached. */
+static id<MTLBuffer> ds4_gpu_offload_cache_alloc_slot(uint64_t  slot_bytes,
+                                                      uint64_t *base_out) {
+    if (!g_device || !base_out ||
+        slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) {
+        return nil;
+    }
+
+    uint32_t slab = g_offload_expert_cache_slab_count;
+    if (slab != 0 &&
+        g_offload_expert_cache_slab_slots_used[slab - 1] <
+            g_offload_expert_cache_slab_slot_count[slab - 1]) {
+        slab--;
+    } else {
+        if (g_offload_expert_cache_slab_count >=
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
+            return nil;
+        }
+        uint32_t total_slots = 0;
+        for (uint32_t i = 0; i < g_offload_expert_cache_slab_count; i++) {
+            total_slots += g_offload_expert_cache_slab_slot_count[i];
+        }
+        const uint32_t remaining =
+            g_offload_expert_cache_budget > total_slots ?
+                g_offload_expert_cache_budget - total_slots : 0;
+        if (remaining == 0) return nil;
+
+        uint64_t target = ds4_gpu_offload_cache_slab_target_bytes();
+        uint64_t slots64 = target / slot_bytes;
+        if (slots64 == 0) slots64 = 1;
+        if (slots64 > remaining) slots64 = remaining;
+        uint32_t slots = slots64 > UINT32_MAX ? UINT32_MAX : (uint32_t)slots64;
+
+        id<MTLBuffer> slab_buffer = nil;
+        while (slots != 0) {
+            if ((uint64_t)slots <= (uint64_t)NSUIntegerMax / slot_bytes) {
+                slab_buffer = [g_device
+                    newBufferWithLength:(NSUInteger)((uint64_t)slots * slot_bytes)
+                                options:MTLResourceStorageModeShared];
+                if (slab_buffer) break;
+            }
+            slots /= 2u;
+        }
+        if (!slab_buffer || slots == 0) {
+            fprintf(stderr,
+                    "ds4: offload expert cache slab allocation failed (%.2f MiB)\n",
+                    ds4_gpu_mib((uint64_t)slot_bytes));
+            return nil;
+        }
+        slab_buffer.label = @"ds4_offload_expert_slab";
+        /* Lock the slab so resident experts never page out (best effort: mlock
+         * is bounded by RLIMIT_MEMLOCK, so a failure only costs pageability). */
+        void *contents = slab_buffer.contents;
+        if (contents && mlock(contents, (size_t)slab_buffer.length) != 0) {
+            fprintf(stderr,
+                    "ds4: offload expert cache mlock failed (%.2f MiB): %s "
+                    "(continuing unlocked)\n",
+                    ds4_gpu_mib((uint64_t)slab_buffer.length), strerror(errno));
+        }
+
+        slab = g_offload_expert_cache_slab_count++;
+        g_offload_expert_cache_slabs[slab] = slab_buffer;
+        g_offload_expert_cache_slab_slot_count[slab] = slots;
+        g_offload_expert_cache_slab_slots_used[slab] = 0;
+    }
+
+    const uint32_t local = g_offload_expert_cache_slab_slots_used[slab]++;
+    *base_out = (uint64_t)local * slot_bytes;
+    return g_offload_expert_cache_slabs[slab];
+}
+
+void ds4_gpu_offload_cache_reset(void) {
+    for (uint32_t layer = 0; layer < DS4_OFFLOAD_N_LAYER; layer++) {
+        for (uint32_t x = 0; x < DS4_OFFLOAD_N_ROUTED; x++) {
+            ds4_gpu_offload_expert_entry *e = &g_offload_expert_cache[layer][x];
+            e->gate_buffer = nil; /* ARC releases the slab reference */
+            e->up_buffer = nil;
+            e->down_buffer = nil;
+            e->gate_inner = 0;
+            e->up_inner = 0;
+            e->down_inner = 0;
+            e->slab_slot = 0;
+            e->last_used = 0;
+            e->valid = 0;
+        }
+    }
+    for (uint32_t s = 0; s < g_offload_expert_cache_slab_count; s++) {
+        id<MTLBuffer> b = g_offload_expert_cache_slabs[s];
+        if (b && b.contents) munlock(b.contents, (size_t)b.length);
+        g_offload_expert_cache_slabs[s] = nil;
+        g_offload_expert_cache_slab_slot_count[s] = 0;
+        g_offload_expert_cache_slab_slots_used[s] = 0;
+    }
+    g_offload_expert_cache_slab_count = 0;
+    g_offload_expert_cache_slab_slot_bytes = 0;
+    g_offload_expert_cache_expert_bytes = 0;
+    g_offload_expert_cache_budget = 0;
+    g_offload_expert_cache_resident = 0;
+    g_offload_expert_cache_active = false;
+    g_offload_expert_cache_hits = 0;
+    g_offload_expert_cache_misses = 0;
+}
+
+int ds4_gpu_offload_cache_configure(uint64_t gate_expert_bytes,
+                                    uint64_t down_expert_bytes,
+                                    uint32_t budget_experts,
+                                    char *err, size_t errlen) {
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 || budget_experts == 0 ||
+        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
+        if (err) snprintf(err, errlen, "offload cache: invalid configure args");
+        return -1;
+    }
+    uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (page != 0) slot_bytes = round_up_u64(slot_bytes, page);
+    if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) {
+        if (err) snprintf(err, errlen, "offload cache: slot size out of range");
+        return -1;
+    }
+    if (g_offload_expert_cache_active &&
+        g_offload_expert_cache_slab_slot_bytes != slot_bytes) {
+        if (err) snprintf(err, errlen,
+                          "offload cache: expert size changed after configure");
+        return -1;
+    }
+    g_offload_expert_cache_slab_slot_bytes = slot_bytes;
+    g_offload_expert_cache_expert_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+    g_offload_expert_cache_budget = budget_experts;
+    g_offload_expert_cache_active = true;
+    return 0;
+}
+
+int ds4_gpu_offload_cache_install_expert(int layer, int expert,
+                                         uint64_t gate_abs_offset,
+                                         uint64_t up_abs_offset,
+                                         uint64_t down_abs_offset,
+                                         uint64_t gate_expert_bytes,
+                                         uint64_t down_expert_bytes,
+                                         char *err, size_t errlen) {
+    if (!g_offload_expert_cache_active) {
+        if (err) snprintf(err, errlen, "offload cache: configure before install");
+        return -1;
+    }
+    if (layer < 0 || layer >= DS4_OFFLOAD_N_LAYER ||
+        expert < 0 || expert >= DS4_OFFLOAD_N_ROUTED) {
+        if (err) snprintf(err, errlen, "offload cache: layer/expert out of range");
+        return -1;
+    }
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
+        if (err) snprintf(err, errlen, "offload cache: bad expert byte size");
+        return -1;
+    }
+    if (!g_initialized && !ds4_gpu_init()) {
+        if (err) snprintf(err, errlen, "offload cache: Metal init failed");
+        return -1;
+    }
+
+    ds4_gpu_offload_expert_entry *e = &g_offload_expert_cache[layer][expert];
+    if (e->valid) return 0;                                   /* idempotent */
+    if (g_offload_expert_cache_resident >= g_offload_expert_cache_budget) {
+        return 1;                          /* budget full: skip, not an error */
+    }
+
+    /* This expert's slot must match the configured layout. */
+    uint64_t want = gate_expert_bytes * 2ull + down_expert_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (page != 0) want = round_up_u64(want, page);
+    if (want != g_offload_expert_cache_slab_slot_bytes) {
+        if (err) snprintf(err, errlen,
+                          "offload cache: expert size mismatch vs configure");
+        return -1;
+    }
+
+    uint64_t base = 0;
+    id<MTLBuffer> slab =
+        ds4_gpu_offload_cache_alloc_slot(g_offload_expert_cache_slab_slot_bytes,
+                                         &base);
+    if (!slab) {
+        if (err) snprintf(err, errlen, "offload cache: slab slot allocation failed");
+        return -1;
+    }
+    uint8_t *contents = (uint8_t *)slab.contents;
+    if (!contents) {
+        if (err) snprintf(err, errlen, "offload cache: slab has no CPU contents");
+        return -1;
+    }
+
+    const uint64_t gate_inner = base;
+    const uint64_t up_inner   = base + gate_expert_bytes;
+    const uint64_t down_inner = base + gate_expert_bytes * 2ull;
+
+    uint64_t rb = 0;
+    double ms = 0.0;
+    if (!ds4_gpu_stream_expert_pread_into(gate_abs_offset, gate_expert_bytes,
+                                          contents + gate_inner, &rb, &ms) ||
+        !ds4_gpu_stream_expert_pread_into(up_abs_offset, gate_expert_bytes,
+                                          contents + up_inner, &rb, &ms) ||
+        !ds4_gpu_stream_expert_pread_into(down_abs_offset, down_expert_bytes,
+                                          contents + down_inner, &rb, &ms)) {
+        /* The slot was consumed but never validated; a populate error is fatal
+         * to startup so the leaked slot never matters. */
+        if (err) snprintf(err, errlen,
+                          "offload cache: pread failed for layer %d expert %d",
+                          layer, expert);
+        return -1;
+    }
+
+    e->gate_buffer = slab;
+    e->up_buffer = slab;
+    e->down_buffer = slab;
+    e->gate_inner = (NSUInteger)gate_inner;
+    e->up_inner = (NSUInteger)up_inner;
+    e->down_inner = (NSUInteger)down_inner;
+    e->slab_slot = g_offload_expert_cache_resident;
+    e->last_used = 0;
+    e->valid = 1;
+    g_offload_expert_cache_resident++;
+    return 0;
+}
+
+void ds4_gpu_offload_cache_stats(uint32_t *resident, uint32_t *budget,
+                                 uint32_t *slab_count, uint64_t *bytes_allocated) {
+    if (resident) *resident = g_offload_expert_cache_resident;
+    if (budget) *budget = g_offload_expert_cache_budget;
+    if (slab_count) *slab_count = g_offload_expert_cache_slab_count;
+    if (bytes_allocated) {
+        uint64_t total = 0;
+        for (uint32_t s = 0; s < g_offload_expert_cache_slab_count; s++) {
+            id<MTLBuffer> b = g_offload_expert_cache_slabs[s];
+            if (b) total += (uint64_t)b.length;
+        }
+        *bytes_allocated = total;
+    }
+}
+
 static uint64_t ds4_gpu_stream_expert_buffer_object_count(
         id<MTLBuffer> gate,
         id<MTLBuffer> up,

@@ -207,6 +207,32 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+
+/* Offload expert cache (Metal only) — a SEPARATE mlock'd LRU cache from the
+ * SSD-streaming cache, holding the routed experts this node owns (coordinator:
+ * hot; worker: cold). Populated from the GGUF (pread) at startup; the offload
+ * compute reads resident slots via the existing slots6 kernels. See
+ * DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md and ds4_engine_offload_populate_cache. */
+void ds4_gpu_offload_cache_reset(void);
+/* Fix the per-expert slot layout (gate|up|down) and the resident budget before
+ * any install. Returns 0, or -1 (message in err). */
+int ds4_gpu_offload_cache_configure(uint64_t gate_expert_bytes,
+                                    uint64_t down_expert_bytes,
+                                    uint32_t budget_experts,
+                                    char *err, size_t errlen);
+/* pread one expert's gate/up/down weights into a fresh mlock'd slab slot.
+ * Returns 0 installed (or already resident, idempotent), 1 skipped because the
+ * resident budget is full, -1 on error (message in err). */
+int ds4_gpu_offload_cache_install_expert(int layer, int expert,
+                                         uint64_t gate_abs_offset,
+                                         uint64_t up_abs_offset,
+                                         uint64_t down_abs_offset,
+                                         uint64_t gate_expert_bytes,
+                                         uint64_t down_expert_bytes,
+                                         char *err, size_t errlen);
+void ds4_gpu_offload_cache_stats(uint32_t *resident, uint32_t *budget,
+                                 uint32_t *slab_count, uint64_t *bytes_allocated);
+
 void ds4_gpu_print_memory_report(const char *label);
 
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
