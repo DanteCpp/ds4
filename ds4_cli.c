@@ -2252,6 +2252,28 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
+    /* ---- Unit C step 1: coordinator expert-offload client connect ----
+     * Dial the worker and complete the HELLO handshake. On success the worker
+     * (mtwo) prints "coordinator connected" with no reject line. On failure we
+     * fall back to solo streaming (plan Phase-4 graceful degrade). The decode
+     * splice (step 2) is not yet wired, so generation still runs solo here; this
+     * block only proves the wire handshake end-to-end against a live worker. */
+    ds4_offload_client *offload_cli = NULL;
+    if (cfg.offload.host && cfg.offload.host[0]) {
+        ds4_offload_hello hello = cli_offload_hello(engine);
+        char offerr[256] = "";
+        int offport = cfg.offload.port ? cfg.offload.port : DS4_OFFLOAD_DEFAULT_PORT;
+        offload_cli = ds4_offload_client_connect(cfg.offload.host, offport,
+                                                 &hello, 5.0, offerr, sizeof(offerr));
+        if (offload_cli) {
+            fprintf(stderr, "ds4: expert-offload: connected to worker %s:%d\n",
+                    cfg.offload.host, offport);
+        } else {
+            fprintf(stderr, "ds4: expert-offload: connect to %s:%d failed (%s); "
+                            "running solo\n", cfg.offload.host, offport, offerr);
+        }
+    }
+
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend,
                            cfg.gen.ctx_size,
@@ -2277,6 +2299,7 @@ int main(int argc, char **argv) {
         rc = run_generation(engine, &cfg);
     }
     if (tp_leader) ds4_tp_send_stop(tp_leader);
+    if (offload_cli) ds4_offload_client_close(offload_cli);
     ds4_engine_close(engine);
     ds4_tp_free(tp_leader);
     ds4_dist_options_free(cfg.dist);

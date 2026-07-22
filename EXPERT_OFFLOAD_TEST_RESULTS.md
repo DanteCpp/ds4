@@ -130,7 +130,7 @@ Notes:
 
 ## Phase 2 — Offloaded decode correctness + latency hiding (needs Unit C)
 
-_Status: blocked on building Unit C on mone (coordinator decode splice)._
+_In progress. Unit C step 1 (coordinator client connect) built + verified (HELLO handshake OK over bridge0). Step 2 (decode splice) next._
 
 Acceptance (handoff correctness invariant): with the worker returning the exact
 experts the coordinator would otherwise compute locally, the **per-token
@@ -145,16 +145,46 @@ decode t/s offloaded vs solo, and wire MB/token.
 | Worker tax (mtwo GPU %, t/s served) | | | |
 | Cache hit rate (residency) | | | |
 
+### Unit C step 1 — coordinator client connect (HELLO handshake)
+
+Built: in `ds4_cli.c main()`, after `ds4_engine_open` (and past the worker /
+tp-worker / distributed-worker early returns), when `cfg.offload.host` is set,
+call `ds4_offload_client_connect(host, port, &cli_offload_hello(engine), 5.0, …)`;
+log success/failure; close the client in the shutdown cleanup. Solo fallback on
+connect failure (plan Phase-4 degrade). No engine-struct change yet (the client
+stays local to `main()`); step 2 will stash it on the engine for the splice.
+
+Test (mone → mtwo over bridge0, `--inspect` so no inference/expert loading):
+```sh
+./ds4 --inspect --ssd-streaming \
+      --expert-offload 169.254.14.255 --expert-offload-port 47300 \
+      -m ds4flash.gguf
+```
+mone log:
+```
+ds4: expert-offload: connected to worker 169.254.14.255:47300
+model: DeepSeek V4 Flash
+... (summary: layers=43 experts=256 used=6 — matches DS4_OFFLOAD_* constants)
+```
+Process exited cleanly → the `ds4_offload_client_close` shutdown path ran.
+
+**Result: PASS.** `ds4_offload_client_connect` returned a live client; the HELLO
+handshake completed over Thunderbolt (no `rejecting coordinator` on mtwo). The
+wire path is proven end-to-end up to the expert-compute loop. Step 2 (the decode
+splice that actually issues `EXPERT_REQ`) is the remaining work.
+
 ---
 
 ## Open items before the real test can run
 
-1. **Build Unit C on mone:** coordinator client bring-up in `ds4_cli.c main()`
-   (`ds4_offload_client_connect` after `ds4_engine_open`, stash client +
-   `offload_active` on engine, close on shutdown, solo fallback on connect fail);
-   decode splice at the 6 routed-MoE sites gated on `offload_active`
-   (residency split → issue remote `EXPERT_REQ` first, compute local experts with
-   remote weights zeroed, `collect` + add f16 partial before shared/HC combine).
+1. **Build Unit C on mone:**
+   - ✅ Step 1 — coordinator client connect in `ds4_cli.c main()`
+     (`ds4_offload_client_connect` after `ds4_engine_open`, close on shutdown,
+     solo fallback on connect fail). **Verified** (HELLO handshake PASS).
+   - ☐ Step 2 — decode splice at the 6 routed-MoE sites gated on `offload_active`
+     (stash client on engine; residency split → issue remote `EXPERT_REQ` first,
+     compute local experts with remote weights zeroed, `collect` + add f16
+     partial before shared/HC combine).
 2. **Build Step-1 hidden-state-hash harness:** fixed hidden + expert set,
    compute weighted sum two ways — (a) normal decode routed forward,
    (b) `ds4_engine_offload_compute_experts` — assert match within IQ2 noise
