@@ -3,11 +3,13 @@
 /ds4-bench
 /ds4-eval
 /ds4-agent
+/ds4-offload-ping
 /ds4_native
 /ds4_agent_test
 /ds4_server_test
 /ds4_test
 /ds4flash.gguf
+*.expbundle
 /TODO.md
 /gguf/
 /core
