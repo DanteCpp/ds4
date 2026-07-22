@@ -56127,19 +56127,35 @@ int ds4_engine_embd_dim(ds4_engine *e) {
 }
 
 /* Distributed expert offload (Metal only), see DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md.
- * The worker calls this to run `k` routed experts of `layer` on one hidden
- * vector (n_embd f16) and return their weighted sum (n_embd f16). The strong
+ * Runs `k` routed experts of `layer` on one hidden vector and returns their
+ * weighted sum, reusing the verified per-layer routed-MoE forward. The strong
  * implementation lives in ds4_metal.m; every other backend links the weak
  * fallback below, which reports "unsupported" so the worker replies with a zero
- * vector and the coordinator can degrade to solo streaming. */
+ * vector and the coordinator can degrade to solo streaming.
+ *
+ * NOTE (unverified): the compute reuses ds4_gpu_routed_moe_one_tensor with an
+ * explicit selected/weights set. It needs a per-token hidden-state-hash check
+ * against a single-machine reference (two ds4 processes on one host, or the
+ * two-Mac e2e) before it can be trusted. See the plan's Validation section. */
 __attribute__((weak))
-int ds4_gpu_offload_compute_experts(int layer,
-                                    const uint16_t *expert_ids,
-                                    const float *weights, int k,
-                                    const uint16_t *hidden_f16,
-                                    uint16_t *out_f16) {
-    (void)layer; (void)expert_ids; (void)weights; (void)k;
-    (void)hidden_f16; (void)out_f16;
+int ds4_gpu_offload_run_layer(const void *model_map, uint64_t model_size,
+                              uint64_t gate_offset, uint64_t up_offset,
+                              uint64_t down_offset, uint32_t gate_type,
+                              uint32_t down_type, uint64_t gate_expert_bytes,
+                              uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+                              uint64_t down_row_bytes, uint32_t expert_in_dim,
+                              uint32_t expert_mid_dim, uint32_t out_dim,
+                              uint32_t n_total_expert, uint32_t n_expert_used,
+                              float clamp, int layer,
+                              const uint16_t *expert_ids, const float *weights,
+                              int k, const uint16_t *hidden_f16,
+                              uint16_t *out_f16) {
+    (void)model_map; (void)model_size; (void)gate_offset; (void)up_offset;
+    (void)down_offset; (void)gate_type; (void)down_type; (void)gate_expert_bytes;
+    (void)gate_row_bytes; (void)down_expert_bytes; (void)down_row_bytes;
+    (void)expert_in_dim; (void)expert_mid_dim; (void)out_dim;
+    (void)n_total_expert; (void)n_expert_used; (void)clamp; (void)layer;
+    (void)expert_ids; (void)weights; (void)k; (void)hidden_f16; (void)out_f16;
     return -1;
 }
 
@@ -56148,9 +56164,32 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
                                        const float *weights, int k,
                                        const uint16_t *hidden_f16,
                                        uint16_t *out_f16) {
-    (void)e;
-    return ds4_gpu_offload_compute_experts(layer, expert_ids, weights, k,
-                                           hidden_f16, out_f16);
+    if (!e || layer < 0 || layer >= ds4_engine_layer_count(e) ||
+        k <= 0 || (uint32_t)k > (uint32_t)DS4_N_EXPERT_USED) {
+        return -1;
+    }
+    const ds4_layer_weights *l = &e->weights.layer[layer];
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return -1;
+
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row_bytes = routed_expert_row_bytes(l->ffn_down_exps);
+    if (gate_row_bytes == 0 || down_row_bytes == 0) return -1;
+    const uint64_t gate_expert_bytes = l->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t down_expert_bytes = l->ffn_down_exps->dim[1] * down_row_bytes;
+
+    return ds4_gpu_offload_run_layer(
+            e->model.map, e->model.size,
+            l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset,
+            l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            (uint32_t)l->ffn_gate_exps->dim[0],
+            (uint32_t)l->ffn_down_exps->dim[0],
+            (uint32_t)DS4_N_EMBD,
+            (uint32_t)DS4_N_EXPERT, (uint32_t)DS4_N_EXPERT_USED,
+            DS4_SWIGLU_CLAMP_EXP, layer,
+            expert_ids, weights, k, hidden_f16, out_f16);
 }
 
 uint64_t ds4_engine_model_bytes(ds4_engine *e) {

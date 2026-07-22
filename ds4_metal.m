@@ -3567,25 +3567,143 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
 
 /* Distributed expert offload worker compute (Metal), strong override of the
  * weak fallback in ds4.c. Runs `k` routed experts of `layer` on one hidden
- * vector and returns their weighted sum. See DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md
- * §5.3. Unit B replaces this stub with the real single-token MoE dispatch that
- * reuses the pair-swiglu expert kernels; until then it reports unsupported so
- * the worker replies with a zero vector and correctness cannot silently drift. */
-int ds4_gpu_offload_compute_experts(int layer,
-                                    const uint16_t *expert_ids,
-                                    const float *weights, int k,
-                                    const uint16_t *hidden_f16,
-                                    uint16_t *out_f16) {
-    (void)layer; (void)expert_ids; (void)weights; (void)k;
-    (void)hidden_f16; (void)out_f16;
-    static int warned = 0;
-    if (!warned) {
-        warned = 1;
-        fprintf(stderr,
-                "ds4-offload: worker expert compute not yet implemented "
-                "(Unit B); replying with zero vectors\n");
+ * vector and returns their weighted sum, reusing the verified per-layer forward
+ * ds4_gpu_routed_moe_one_tensor. See DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md §5.3.
+ *
+ * The optimized single-token expert path assumes n_expert_used routed slots, so
+ * we pad the k requested experts up to n_expert_used with weight-0 copies of
+ * expert_ids[0] (already resident on this worker) — the weighted sum zeroes the
+ * padding, giving exactly the k-expert result.
+ *
+ * UNVERIFIED (Unit B): reuses proven kernels but has never run against a
+ * reference. Two things to confirm in the model loop before trusting it:
+ *   (1) x dtype — the decode feeds the routed forward an f32 normalized hidden;
+ *       we write f32 here. (2) command-buffer lifecycle — routed_moe_one_tensor
+ *       commits+waits on the had_batch==false path, so the read below sees
+ *       completed work. Validate via a per-token hidden-state hash (§10). */
+static ds4_gpu_tensor *g_offload_gate_scratch;   /* n_used * mid_dim f32 */
+static ds4_gpu_tensor *g_offload_up_scratch;
+static ds4_gpu_tensor *g_offload_mid_scratch;
+static ds4_gpu_tensor *g_offload_down_scratch;   /* n_used * out_dim f32 */
+static ds4_gpu_tensor *g_offload_out_scratch;    /* out_dim f32 */
+static ds4_gpu_tensor *g_offload_x_scratch;      /* in_dim f32 */
+static ds4_gpu_tensor *g_offload_selected;       /* n_used i32 */
+static ds4_gpu_tensor *g_offload_weights;        /* n_used f32 */
+static uint32_t g_offload_scratch_used;          /* n_expert_used the scratch fits */
+static uint32_t g_offload_scratch_mid;
+static uint32_t g_offload_scratch_out;
+static uint32_t g_offload_scratch_in;
+
+int ds4_gpu_offload_run_layer(const void *model_map, uint64_t model_size,
+                              uint64_t gate_offset, uint64_t up_offset,
+                              uint64_t down_offset, uint32_t gate_type,
+                              uint32_t down_type, uint64_t gate_expert_bytes,
+                              uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+                              uint64_t down_row_bytes, uint32_t expert_in_dim,
+                              uint32_t expert_mid_dim, uint32_t out_dim,
+                              uint32_t n_total_expert, uint32_t n_expert_used,
+                              float clamp, int layer,
+                              const uint16_t *expert_ids, const float *weights,
+                              int k, const uint16_t *hidden_f16,
+                              uint16_t *out_f16) {
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!model_map || !expert_ids || !weights || !hidden_f16 || !out_f16) return -1;
+    if (k <= 0 || n_expert_used == 0 ||
+        (uint32_t)k > n_expert_used ||
+        n_expert_used > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
+        expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0) {
+        return -1;
     }
-    return -1;
+    const uint32_t nu = n_expert_used;
+
+    /* (Re)allocate persistent shared scratch sized to this model's dims. */
+    if (!g_offload_gate_scratch || g_offload_scratch_used != nu ||
+        g_offload_scratch_mid != expert_mid_dim ||
+        g_offload_scratch_out != out_dim ||
+        g_offload_scratch_in != expert_in_dim) {
+        g_offload_gate_scratch = ds4_gpu_tensor_alloc((uint64_t)nu * expert_mid_dim * sizeof(float));
+        g_offload_up_scratch   = ds4_gpu_tensor_alloc((uint64_t)nu * expert_mid_dim * sizeof(float));
+        g_offload_mid_scratch  = ds4_gpu_tensor_alloc((uint64_t)nu * expert_mid_dim * sizeof(float));
+        g_offload_down_scratch = ds4_gpu_tensor_alloc((uint64_t)nu * out_dim * sizeof(float));
+        g_offload_out_scratch  = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        g_offload_x_scratch    = ds4_gpu_tensor_alloc((uint64_t)expert_in_dim * sizeof(float));
+        g_offload_selected     = ds4_gpu_tensor_alloc((uint64_t)nu * sizeof(int32_t));
+        g_offload_weights      = ds4_gpu_tensor_alloc((uint64_t)nu * sizeof(float));
+        if (!g_offload_gate_scratch || !g_offload_up_scratch ||
+            !g_offload_mid_scratch || !g_offload_down_scratch ||
+            !g_offload_out_scratch || !g_offload_x_scratch ||
+            !g_offload_selected || !g_offload_weights) {
+            return -1;
+        }
+        g_offload_scratch_used = nu;
+        g_offload_scratch_mid = expert_mid_dim;
+        g_offload_scratch_out = out_dim;
+        g_offload_scratch_in = expert_in_dim;
+    }
+
+    /* selected[nu]: real ids first, then weight-0 padding reusing ids[0]. */
+    int32_t sel[DS4_METAL_MAX_ROUTED_EXPERT_USED];
+    float wpad[DS4_METAL_MAX_ROUTED_EXPERT_USED];
+    for (uint32_t i = 0; i < nu; i++) {
+        if ((int)i < k) { sel[i] = (int32_t)expert_ids[i]; wpad[i] = weights[i]; }
+        else            { sel[i] = (int32_t)expert_ids[0]; wpad[i] = 0.0f; }
+    }
+    if (!ds4_gpu_tensor_write(g_offload_selected, 0, sel, (uint64_t)nu * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g_offload_weights, 0, wpad, (uint64_t)nu * sizeof(float))) {
+        return -1;
+    }
+
+    /* x: f16 hidden -> f32 (the routed forward consumes an f32 normalized hidden). */
+    {
+        float *x = malloc((size_t)expert_in_dim * sizeof(float));
+        if (!x) return -1;
+        for (uint32_t i = 0; i < expert_in_dim; i++) {
+            _Float16 h;
+            memcpy(&h, &hidden_f16[i], sizeof(h));
+            x[i] = (float)h;
+        }
+        int wrote = ds4_gpu_tensor_write(g_offload_x_scratch, 0, x,
+                                         (uint64_t)expert_in_dim * sizeof(float));
+        free(x);
+        if (!wrote) return -1;
+    }
+
+    /* We supply the selection explicitly; make sure no stale GPU-router
+     * override shadows it. */
+    ds4_gpu_routed_moe_set_selected_override(NULL, 0);
+
+    int ok = ds4_gpu_routed_moe_one_tensor(
+            g_offload_out_scratch, g_offload_gate_scratch, g_offload_up_scratch,
+            g_offload_mid_scratch, g_offload_down_scratch,
+            model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            g_offload_selected, g_offload_weights,
+            n_total_expert, nu, clamp,
+            g_offload_x_scratch, NULL /* add_in: worker returns pure routed sum */,
+            (uint32_t)layer, false);
+    if (!ok) return -1;
+
+    /* had_batch==false path in routed_moe_one_tensor commits+waits, so the
+     * shared out buffer is ready. Flush defensively in case a batch is open. */
+    ds4_gpu_end_commands();
+
+    float *o = malloc((size_t)out_dim * sizeof(float));
+    if (!o) return -1;
+    if (!ds4_gpu_tensor_read(g_offload_out_scratch, 0, o,
+                             (uint64_t)out_dim * sizeof(float))) {
+        free(o);
+        return -1;
+    }
+    for (uint32_t i = 0; i < out_dim; i++) {
+        _Float16 h = (_Float16)o[i];
+        memcpy(&out_f16[i], &h, sizeof(h));
+    }
+    free(o);
+    return 0;
 }
 
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {

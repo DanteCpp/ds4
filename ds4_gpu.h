@@ -2200,6 +2200,25 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 
+/* Distributed expert offload worker compute (Metal only). Runs `k` routed
+ * experts of `layer` (weighted by `weights`) on one hidden vector `hidden_f16`
+ * (expert_in_dim f16) and writes their weighted sum into `out_f16` (out_dim
+ * f16), reusing ds4_gpu_routed_moe_one_tensor. Returns 0 on success, -1 if
+ * unsupported (non-Metal backends link a weak fallback). Callers pass per-layer
+ * expert-tensor offsets/types/sizes; see ds4_engine_offload_compute_experts. */
+int ds4_gpu_offload_run_layer(const void *model_map, uint64_t model_size,
+                              uint64_t gate_offset, uint64_t up_offset,
+                              uint64_t down_offset, uint32_t gate_type,
+                              uint32_t down_type, uint64_t gate_expert_bytes,
+                              uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+                              uint64_t down_row_bytes, uint32_t expert_in_dim,
+                              uint32_t expert_mid_dim, uint32_t out_dim,
+                              uint32_t n_total_expert, uint32_t n_expert_used,
+                              float clamp, int layer,
+                              const uint16_t *expert_ids, const float *weights,
+                              int k, const uint16_t *hidden_f16,
+                              uint16_t *out_f16);
+
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,

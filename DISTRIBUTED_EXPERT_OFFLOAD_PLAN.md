@@ -337,11 +337,15 @@ collects `EXPERT_RESP` by `seq` so per-layer requests can overlap local compute.
 ## 9. Implementation roadmap
 
 > **Implementation status (branch `expert-offload`).** The reusable transport
-> core is built and unit-tested off-hardware; the remaining items are the
-> Metal-graph surgery + operational steps that need the two-Mac loop to verify.
-> New files: `ds4_offload.{c,h}` (transport, worker loop, residency table,
-> ping-pong gate), `ds4_offload_ping.c` (`./ds4-offload-ping`). Wired into the
-> Metal `CORE_OBJS` in the Makefile (Metal only).
+> core is built and unit-tested off-hardware. The worker's expert compute
+> (Unit B) is written but **unverified** — it reuses the proven per-layer
+> forward `ds4_gpu_routed_moe_one_tensor`, but has not been run against a
+> reference; a per-token hidden-state-hash check (§10) on the model loop is
+> required before trusting it. New files: `ds4_offload.{c,h}` (transport, worker
+> loop, residency table, ping-pong gate), `ds4_offload_ping.c`
+> (`./ds4-offload-ping`). Engine seam: `ds4_engine_offload_compute_experts`
+> (ds4.c) → `ds4_gpu_offload_run_layer` (ds4_metal.m, weak `-1` fallback for
+> non-Metal). Wired into every backend's `CORE_OBJS`.
 
 **Phase 0 — Measure & de-risk (0.5 day).**
 - [x] Real TCP `TCP_NODELAY` ping-pong bouncing an 8 KB buffer over `bridge0`
@@ -359,6 +363,10 @@ collects `EXPERT_RESP` by `seq` so per-layer requests can overlap local compute.
 - [x] New `ds4_offload.c` transport (persistent `TCP_NODELAY` socket, frames §8).
 - [x] Worker expert-server loop (no attention/KV/graph): `ds4_offload_worker_run`,
       one coordinator at a time, replies before background evict-load (§5.3, §6).
+- [~] Worker expert compute (Unit B): `ds4_gpu_offload_run_layer` reuses the
+      proven per-layer forward with an explicit selected/weights set (padding k
+      up to n_expert_used with weight-0 slots). **Written, unverified** — needs
+      the hidden-state-hash check.
 - [x] Residency table + O(k) local/remote split (`ds4_offload_residency_*`, §5.1).
 - [~] New engine mode: `--expert-offload` (coord) / `--role expert-server` (worker).
       *transport + worker loop done; CLI wiring into `ds4.c` still to do.*
