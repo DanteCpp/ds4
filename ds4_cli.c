@@ -2266,6 +2266,7 @@ int main(int argc, char **argv) {
         offload_cli = ds4_offload_client_connect(cfg.offload.host, offport,
                                                  &hello, 5.0, offerr, sizeof(offerr));
         if (offload_cli) {
+            ds4_engine_offload_bind(engine, offload_cli);
             fprintf(stderr, "ds4: expert-offload: connected to worker %s:%d\n",
                     cfg.offload.host, offport);
         } else {

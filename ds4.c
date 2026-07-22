@@ -43,6 +43,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_tp.h"
+#include "ds4_offload.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
  * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
@@ -35388,7 +35389,36 @@ struct ds4_engine {
      * Zero / negative = legacy 4096 fallback (single-tier paths and any
      * caller that doesn't set the option observe the prior behavior). */
     int            placement_ctx_hint;
+
+    /* Distributed expert offload (coordinator side). offload_active gates the
+     * decode splice; offload_client is the persistent worker connection;
+     * offload_residency is the per-layer local/remote expert partition. */
+    ds4_offload_client   *offload_client;
+    bool                  offload_active;
+    ds4_offload_residency offload_residency;
 };
+
+void ds4_engine_offload_bind(ds4_engine *e, ds4_offload_client *client) {
+    if (!e) return;
+    e->offload_client = client;
+    e->offload_active = (client != NULL);
+}
+
+bool ds4_engine_offload_active(const ds4_engine *e) {
+    return e && e->offload_active && e->offload_client;
+}
+
+ds4_offload_client *ds4_engine_offload_client(const ds4_engine *e) {
+    return e ? e->offload_client : NULL;
+}
+
+const ds4_offload_residency *ds4_engine_offload_residency(const ds4_engine *e) {
+    return e ? &e->offload_residency : NULL;
+}
+
+void ds4_engine_offload_set_residency(ds4_engine *e, const ds4_offload_residency *r) {
+    if (e && r) e->offload_residency = *r;
+}
 
 static uint64_t ds4_engine_dynamic_expert_cache_bytes(
         const ds4_engine *e) {

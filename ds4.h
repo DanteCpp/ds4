@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "ds4_ssd.h"
+#include "ds4_offload.h"
 
 /* Public engine boundary.
  *
@@ -262,6 +263,16 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
  * clean Metal state and diff against the captured routed_out. No-op unless
  * DS4_OFFLOAD_SELFTEST_LAYER was set. */
 void ds4_offload_selftest_finalize(ds4_engine *e);
+/* Distributed expert offload — coordinator side. Bind the connected worker
+ * client and mark the engine offload-active (gates the decode splice). The
+ * residency table is the per-layer local/remote expert partition (hot ~64%
+ * local, rest remote). The client pointer is borrowed (owned/closed by the
+ * caller), not freed by the engine. */
+void ds4_engine_offload_bind(ds4_engine *e, ds4_offload_client *client);
+bool ds4_engine_offload_active(const ds4_engine *e);
+ds4_offload_client *ds4_engine_offload_client(const ds4_engine *e);
+const ds4_offload_residency *ds4_engine_offload_residency(const ds4_engine *e);
+void ds4_engine_offload_set_residency(ds4_engine *e, const ds4_offload_residency *r);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
