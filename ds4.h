@@ -247,6 +247,16 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+
+/* Distributed expert offload worker hook (Metal only). Runs `k` routed experts
+ * of `layer` on one hidden vector (n_embd f16 in `hidden_f16`), writing their
+ * weighted sum into `out_f16` (n_embd f16). Returns 0 on success, -1 if the
+ * backend does not support offload (non-Metal builds). */
+int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
+                                       const uint16_t *expert_ids,
+                                       const float *weights, int k,
+                                       const uint16_t *hidden_f16,
+                                       uint16_t *out_f16);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);

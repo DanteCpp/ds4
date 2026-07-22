@@ -56126,6 +56126,33 @@ int ds4_engine_embd_dim(ds4_engine *e) {
     return (int)DS4_N_EMBD;
 }
 
+/* Distributed expert offload (Metal only), see DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md.
+ * The worker calls this to run `k` routed experts of `layer` on one hidden
+ * vector (n_embd f16) and return their weighted sum (n_embd f16). The strong
+ * implementation lives in ds4_metal.m; every other backend links the weak
+ * fallback below, which reports "unsupported" so the worker replies with a zero
+ * vector and the coordinator can degrade to solo streaming. */
+__attribute__((weak))
+int ds4_gpu_offload_compute_experts(int layer,
+                                    const uint16_t *expert_ids,
+                                    const float *weights, int k,
+                                    const uint16_t *hidden_f16,
+                                    uint16_t *out_f16) {
+    (void)layer; (void)expert_ids; (void)weights; (void)k;
+    (void)hidden_f16; (void)out_f16;
+    return -1;
+}
+
+int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
+                                       const uint16_t *expert_ids,
+                                       const float *weights, int k,
+                                       const uint16_t *hidden_f16,
+                                       uint16_t *out_f16) {
+    (void)e;
+    return ds4_gpu_offload_compute_experts(layer, expert_ids, weights, k,
+                                           hidden_f16, out_f16);
+}
+
 uint64_t ds4_engine_model_bytes(ds4_engine *e) {
     return e->model.size;
 }

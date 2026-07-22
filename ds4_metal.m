@@ -3565,6 +3565,29 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     g_glm_streaming_prefill_full_layer_runtime = enabled ? 1 : 0;
 }
 
+/* Distributed expert offload worker compute (Metal), strong override of the
+ * weak fallback in ds4.c. Runs `k` routed experts of `layer` on one hidden
+ * vector and returns their weighted sum. See DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md
+ * §5.3. Unit B replaces this stub with the real single-token MoE dispatch that
+ * reuses the pair-swiglu expert kernels; until then it reports unsupported so
+ * the worker replies with a zero vector and correctness cannot silently drift. */
+int ds4_gpu_offload_compute_experts(int layer,
+                                    const uint16_t *expert_ids,
+                                    const float *weights, int k,
+                                    const uint16_t *hidden_f16,
+                                    uint16_t *out_f16) {
+    (void)layer; (void)expert_ids; (void)weights; (void)k;
+    (void)hidden_f16; (void)out_f16;
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr,
+                "ds4-offload: worker expert compute not yet implemented "
+                "(Unit B); replying with zero vectors\n");
+    }
+    return -1;
+}
+
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     if (experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
         experts = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;

@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
+#include "ds4_offload.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
 #include "linenoise.h"
@@ -89,9 +90,19 @@ typedef struct {
     bool metal_graph_prompt_test;
 } cli_generation_options;
 
+/* Distributed expert offload (DISTRIBUTED_EXPERT_OFFLOAD_PLAN.md). Coordinator
+ * sets `host` (the worker to dial); worker sets `worker`. Mutually exclusive. */
+typedef struct {
+    bool worker;            /* --expert-server : run the expert-compute server */
+    const char *host;       /* --expert-offload <host> : coordinator dials this */
+    const char *bind;       /* --expert-offload-bind <ip> : worker bind address */
+    int port;               /* --expert-offload-port <n> (0 = default)         */
+} cli_offload_options;
+
 typedef struct {
     ds4_engine_options engine;
     ds4_dist_options *dist;
+    cli_offload_options offload;
     cli_generation_options gen;
     char *prompt_owned;
     bool inspect;
@@ -100,6 +111,60 @@ typedef struct {
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
 } cli_config;
+
+/* Build this process's HELLO from the loaded engine identity plus the verified
+ * model constants. partition_hash stays 0 until hotlist partitioning lands
+ * (both sides agree on "static full partition"). */
+static ds4_offload_hello cli_offload_hello(ds4_engine *engine) {
+    ds4_offload_hello h = {0};
+    h.magic = DS4_OFFLOAD_MAGIC;
+    h.version = 1;
+    h.n_layer = (uint16_t)ds4_engine_layer_count(engine);
+    h.n_used = DS4_OFFLOAD_N_USED;
+    h.n_embd = (uint32_t)ds4_engine_embd_dim(engine);
+    h.n_routed = DS4_OFFLOAD_N_ROUTED;
+    h.partition_hash = 0;
+    h.model_id = (uint64_t)(uint32_t)ds4_engine_model_id(engine);
+    return h;
+}
+
+/* Worker compute adapter: user is the loaded engine. */
+static int cli_offload_compute(void *user, int layer, const uint16_t *ids,
+                               const float *weights, int k,
+                               const uint16_t *hidden_f16, uint16_t *out_f16) {
+    return ds4_engine_offload_compute_experts((ds4_engine *)user, layer, ids,
+                                              weights, k, hidden_f16, out_f16);
+}
+
+static volatile int cli_offload_stop;
+
+/* Run the expert-compute server (mtwo). Loads the model like any ds4 process;
+ * for single-machine loopback dev launch it with --ssd-streaming and a small
+ * --ssd-streaming-cache-experts so it never mlocks the production ~27 GB. */
+static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
+    if (ds4_engine_embd_dim(engine) != DS4_OFFLOAD_N_EMBD ||
+        ds4_engine_layer_count(engine) != DS4_OFFLOAD_N_LAYER) {
+        fprintf(stderr,
+                "ds4: --expert-server supports DeepSeek-V4-Flash only "
+                "(n_embd %d, n_layer %d expected)\n",
+                DS4_OFFLOAD_N_EMBD, DS4_OFFLOAD_N_LAYER);
+        return 2;
+    }
+    ds4_offload_worker_options opt = {0};
+    opt.bind_host = cfg->offload.bind;
+    opt.port = cfg->offload.port;
+    opt.hello = cli_offload_hello(engine);
+    opt.compute = cli_offload_compute;
+    opt.evict = NULL;                 /* Phase-2 dynamic swaps: not yet */
+    opt.user = engine;
+    opt.stop = &cli_offload_stop;
+    char err[256] = "";
+    if (ds4_offload_worker_run(&opt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: expert-server: %s\n", err);
+        return 1;
+    }
+    return 0;
+}
 
 static volatile sig_atomic_t cli_interrupted;
 static volatile sig_atomic_t cli_dist_busy;
@@ -1875,6 +1940,14 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--expert-server")) {
+            c.offload.worker = true;
+        } else if (!strcmp(arg, "--expert-offload")) {
+            c.offload.host = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-offload-bind")) {
+            c.offload.bind = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-offload-port")) {
+            c.offload.port = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -2118,6 +2191,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (cfg.offload.worker) {
+        int rc = run_offload_worker(engine, &cfg);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (cfg.engine.tp.role == DS4_TP_WORKER) {
         int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
         ds4_engine_close(engine);
