@@ -173,6 +173,74 @@ handshake completed over Thunderbolt (no `rejecting coordinator` on mtwo). The
 wire path is proven end-to-end up to the expert-compute loop. Step 2 (the decode
 splice that actually issues `EXPERT_REQ`) is the remaining work.
 
+### Unit B verification (handoff Step 1) — self-test harness
+
+Built a gated, env-driven self-test (zero overhead when off) that checks the
+worker's expert compute (`ds4_gpu_offload_run_layer`, the Unit B path) against
+the decode's own routed output:
+- `ds4_offload_selftest_capture(...)` is called from each decode routed-MoE path
+  (the `--ssd-streaming` path at `ds4.c:23556` and the non-streaming path at
+  `ds4.c:23650`) right after the routed call. It reads the real
+  `ffn_norm` / `router_selected` / `router_weights` / `routed_out` to host via
+  sync reads (the decode already does mid-stream reads, so this is safe).
+- `ds4_offload_selftest_finalize(engine)` (called from `main()` after generation)
+  replays each captured hidden + selection through `ds4_gpu_offload_run_layer` in
+  a CLEAN Metal state (the way the worker runs it, in isolation — not mid-decode)
+  and diffs the f16-roundtripped result against the captured `routed_out`.
+
+Why capture+replay (not inline): calling `ds4_gpu_offload_run_layer` *mid-decode*
+flushes/encodes into the decode's command buffer and corrupts Metal state
+(`metal prefill failed`, leaked handles). The worker runs it in isolation, so
+replay-after-generation mimics real usage and keeps the decode intact.
+
+Env: `DS4_OFFLOAD_SELFTEST_LAYER=<il>` (default off), `DS4_OFFLOAD_SELFTEST_TOKENS=<n>` (default 4).
+
+Test (mone, single-process, layer 5, 4 tokens):
+```sh
+DS4_OFFLOAD_SELFTEST_LAYER=5 DS4_OFFLOAD_SELFTEST_TOKENS=4 \
+  ./ds4 -m ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 512 -p "Hello" -n 4
+```
+```
+ds4: offload-selftest L=5 tok#0 sel=[35 235 1 92 129 74] max_abs=33.193867 mean_abs=3.682401 max_rel=1.19e+00  <-- over 1e-2
+ds4: offload-selftest L=5 tok#1 sel=[59 35 252 244 243 106] max_abs=5.245254 mean_abs=0.774993 max_rel=7.32e+00  <-- over 1e-2
+ds4: offload-selftest L=5 tok#2 sel=[59 252 140 221 158 52] max_abs=2.144203 mean_abs=0.274467 max_rel=2.07e+00  <-- over 1e-2
+ds4: offload-selftest L=5 tok#3 sel=[180 252 59 30 216 169] max_abs=0.774030 mean_abs=0.178123 max_rel=1.48e+00  <-- over 1e-2
+ds4: offload-selftest DONE layer=5 tokens=4 worst_max_rel=7.32e+00 -> FAIL
+```
+
+**Result: FAIL.** The decode completes cleanly (4 tokens, no corruption), but the
+offload compute diverges from the decode's routed sum by `max_rel` 1.2-7.3 -
+orders of magnitude above the expected f16-wire noise (~1e-3). The error is as
+large as the signal itself, i.e. the offload output is *wrong*, not noisy.
+
+Resolved / ruled out:
+- **Unknown #1 (x dtype): RESOLVED.** `ffn_norm` and `routed_out` graph tensors
+  are f32 (`DS4_N_EMBD * sizeof(float)`), so the kernel consumes `x` as f32 -
+  matching the offload path's f16->f32 conversion. The f16 round-trip of the input
+  is ~1e-3 relative, far too small to explain a `max_rel` of 1-7.
+- **Command-buffer lifecycle:** calling `offload_run_layer` mid-decode corrupts
+  the decode's command buffer; the capture+replay split avoids that and the decode
+  now completes. So lifecycle is not the cause of the numeric divergence.
+- **Stale streaming cache:** clearing `g_stream_expert_cache_*` before the replay
+  produced *identical* numbers - not the cause.
+
+**Likely cause (new blocker):** `ds4_gpu_routed_moe_one_tensor` has two expert
+compute paths - the **streaming-expert-cache path** the decode uses
+(`begin_selected_load` -> resident slots) and the **direct-mmap path** the
+offload/worker uses (read experts at `gate_offset + id*bytes` from the model
+map). For the same expert + hidden + weights, these two paths produce different
+results. The decode sets the selected-override and uses the cache; the offload
+clears the override and reads direct. Both resolve to the same router ids, so
+expert *selection* matches - the divergence is in the *compute* (cache vs
+direct-mmap).
+
+**Implication for the splice (Unit C step 2):** the correctness invariant
+("offloaded == solo per token") cannot hold until the direct-mmap path matches
+the cache path. The coordinator's *local* experts go through the cache path; the
+worker's *remote* experts go through direct-mmap. If they differ for the same
+expert, combining them yields a different result than solo (all-cache). This
+must be fixed before the splice is meaningful.
+
 ---
 
 ## Open items before the real test can run
@@ -185,10 +253,18 @@ splice that actually issues `EXPERT_REQ`) is the remaining work.
      (stash client on engine; residency split → issue remote `EXPERT_REQ` first,
      compute local experts with remote weights zeroed, `collect` + add f16
      partial before shared/HC combine).
-2. **Build Step-1 hidden-state-hash harness:** fixed hidden + expert set,
-   compute weighted sum two ways — (a) normal decode routed forward,
-   (b) `ds4_engine_offload_compute_experts` — assert match within IQ2 noise
-   (single-process first, lower OOM risk). Also resolves the two Unit-B
-   unknowns: `x` dtype (f32 vs f16) and command-buffer lifecycle.
-3. (Phase 1 tail) Seed mone/mtwo split from `ds4_streaming_hotlist.inc` →
+2. **Step-1 hidden-state-hash harness: BUILT** (capture+replay self-test above).
+   - x dtype: RESOLVED (f32).
+   - Command-buffer lifecycle: mid-decode call corrupts -> capture+replay split.
+   - **Finding: FAIL - offload direct-mmap compute != decode streaming-cache
+     compute (max_rel 1-7). New blocker (see #4).**
+3. (Phase 1 tail) Seed mone/mtwo split from `ds4_streaming_hotlist.inc` ->
    residency bitmap + streaming cache warm-start.
+4. **[BLOCKER] Resolve the direct-mmap vs streaming-cache compute divergence in
+   `ds4_gpu_routed_moe_one_tensor` (Unit B).** The worker (direct-mmap) and the
+   coordinator's local experts (streaming-cache path) must produce identical
+   results for the same expert+hidden+weights, or the splice's
+   `offloaded == solo` invariant cannot hold. Investigate the two paths in
+   `ds4_metal.m:34740+` (~5000-line function): the decode uses
+   `begin_selected_load` + the selected-override; the offload clears the
+   override and reads direct. Selection matches; the compute differs.

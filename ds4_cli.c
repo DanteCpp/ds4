@@ -2298,6 +2298,7 @@ int main(int argc, char **argv) {
     } else {
         rc = run_generation(engine, &cfg);
     }
+    ds4_offload_selftest_finalize(engine);
     if (tp_leader) ds4_tp_send_stop(tp_leader);
     if (offload_cli) ds4_offload_client_close(offload_cli);
     ds4_engine_close(engine);

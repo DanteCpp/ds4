@@ -257,6 +257,11 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
                                        const float *weights, int k,
                                        const uint16_t *hidden_f16,
                                        uint16_t *out_f16);
+/* Unit B self-test (EXPERT_OFFLOAD_HANDOFF.md Step 1): after generation, replay
+ * the captured decode routed-MoE inputs through the offload expert compute in a
+ * clean Metal state and diff against the captured routed_out. No-op unless
+ * DS4_OFFLOAD_SELFTEST_LAYER was set. */
+void ds4_offload_selftest_finalize(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);

@@ -4393,6 +4393,62 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     return (t->dim[0] / info->block_elems) * routed_expert_block_bytes(t->type);
 }
 
+/* Unit B self-test (EXPERT_OFFLOAD_HANDOFF.md Step 1). Called from each decode
+ * routed-MoE path right after the routed call: recompute the layer's pure routed
+ * sum via ds4_gpu_offload_run_layer (the worker compute) on the f16-roundtripped
+ * hidden, and diff against the decode's routed_out. Confirms the command-buffer
+ * lifecycle (unknown #2) and quantifies the f16 wire error. Gated by env, zero
+ * work when off (one int compare):
+ *   DS4_OFFLOAD_SELFTEST_LAYER=<il> (default off), DS4_OFFLOAD_SELFTEST_TOKENS=<n> (default 4). */
+/* Unit B self-test (EXPERT_OFFLOAD_HANDOFF.md Step 1). The decode routed-MoE
+ * paths call ds4_offload_selftest_capture() right after the routed call to grab
+ * the real (ffn_norm, router_selected, router_weights, routed_out) via sync
+ * reads (the decode already does mid-stream reads, so this is safe). After
+ * generation, ds4_offload_selftest_finalize() replays the captured hidden +
+ * selection through ds4_gpu_offload_run_layer in a CLEAN Metal state (the way
+ * the worker runs it, in isolation -- not mid-decode) and diffs against the
+ * captured routed_out. This avoids corrupting the decode's command buffer and
+ * confirms the command-buffer lifecycle (unknown #2) + quantifies the f16 wire
+ * error. Gated by env (no-op when off):
+ *   DS4_OFFLOAD_SELFTEST_LAYER=<il> (default off), DS4_OFFLOAD_SELFTEST_TOKENS=<n> (default 4). */
+enum { DS4_OFFLOAD_SELFTEST_MAX_EU = 8 }; /* >= DS4_METAL_MAX_ROUTED_EXPERT_USED */
+static int     g_st_layer = -2, g_st_max = 0, g_st_done = 0;
+static float  *g_st_norm = NULL, *g_st_ref = NULL;
+static int32_t *g_st_sel = NULL;
+static float  *g_st_w = NULL;
+
+static void ds4_offload_selftest_capture(const ds4_gpu_tensor *routed_out,
+                                         const ds4_gpu_tensor *router_selected,
+                                         const ds4_gpu_tensor *router_weights,
+                                         const ds4_gpu_tensor *ffn_norm, int il) {
+    if (g_st_layer == -2) {
+        const char *a = getenv("DS4_OFFLOAD_SELFTEST_LAYER");
+        g_st_layer = a ? atoi(a) : -1;
+        const char *b = getenv("DS4_OFFLOAD_SELFTEST_TOKENS");
+        g_st_max = (b && atoi(b) > 0) ? atoi(b) : 4;
+    }
+    if (g_st_layer < 0 || il != g_st_layer || g_st_done >= g_st_max) return;
+    if (!g_st_norm) {
+        g_st_norm = xmalloc((size_t)g_st_max * DS4_N_EMBD * sizeof(float));
+        g_st_ref  = xmalloc((size_t)g_st_max * DS4_N_EMBD * sizeof(float));
+        g_st_sel  = xmalloc((size_t)g_st_max * DS4_OFFLOAD_SELFTEST_MAX_EU * sizeof(int32_t));
+        g_st_w    = xmalloc((size_t)g_st_max * DS4_OFFLOAD_SELFTEST_MAX_EU * sizeof(float));
+    }
+    const int k = DS4_N_EXPERT_USED;
+    const size_t off = (size_t)g_st_done * DS4_N_EMBD;
+    const size_t oeu = (size_t)g_st_done * DS4_OFFLOAD_SELFTEST_MAX_EU;
+    if (ds4_gpu_tensor_read(routed_out, 0, g_st_ref + off,
+                            (uint64_t)DS4_N_EMBD * sizeof(float)) &&
+        ds4_gpu_tensor_read(router_selected, 0, g_st_sel + oeu,
+                            (uint64_t)k * sizeof(int32_t)) &&
+        ds4_gpu_tensor_read(router_weights, 0, g_st_w + oeu,
+                            (uint64_t)k * sizeof(float)) &&
+        ds4_gpu_tensor_read(ffn_norm, 0, g_st_norm + off,
+                            (uint64_t)DS4_N_EMBD * sizeof(float))) {
+        g_st_done++;
+    }
+}
+
 static bool streaming_layer_routed_expert_bytes(
         const ds4_layer_weights *layer,
         uint64_t               *per_expert_bytes_out) {
@@ -23497,6 +23553,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      il,
                                                      false) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        if (ok) ds4_offload_selftest_capture(metal_graph_routed_out(g), metal_graph_router_selected(g),
+                                             metal_graph_router_weights(g), metal_graph_ffn_norm(g), (int)il);
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
                                           (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -23589,6 +23647,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                  il,
                                                  false) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+    if (ok) ds4_offload_selftest_capture(metal_graph_routed_out(g), metal_graph_router_selected(g),
+                                         metal_graph_router_weights(g), metal_graph_ffn_norm(g), (int)il);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -56157,6 +56217,78 @@ int ds4_gpu_offload_run_layer(const void *model_map, uint64_t model_size,
     (void)n_total_expert; (void)n_expert_used; (void)clamp; (void)layer;
     (void)expert_ids; (void)weights; (void)k; (void)hidden_f16; (void)out_f16;
     return -1;
+}
+
+void ds4_offload_selftest_finalize(ds4_engine *e) {
+    if (g_st_layer < 0 || g_st_done == 0 || !e) return;
+    if (g_st_layer >= ds4_engine_layer_count(e)) return;
+    const ds4_layer_weights *layer = &e->weights.layer[g_st_layer];
+    if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) return;
+    static uint16_t *st_hid = NULL, *st_out = NULL;
+    static float *st_of = NULL;
+    if (!st_hid) {
+        st_hid = xmalloc((size_t)DS4_N_EMBD * sizeof(uint16_t));
+        st_out = xmalloc((size_t)DS4_N_EMBD * sizeof(uint16_t));
+        st_of  = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    }
+    const int k = DS4_N_EXPERT_USED;
+    double worst = 0.0;
+    for (int t = 0; t < g_st_done; t++) {
+        const size_t off = (size_t)t * DS4_N_EMBD;
+        const size_t oeu = (size_t)t * DS4_OFFLOAD_SELFTEST_MAX_EU;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+            _Float16 h = (_Float16)g_st_norm[off + i];   /* f32 -> f16 (the wire) */
+            memcpy(&st_hid[i], &h, sizeof(h));
+        }
+        uint16_t ids[DS4_OFFLOAD_SELFTEST_MAX_EU];
+        for (int i = 0; i < k; i++) ids[i] = (uint16_t)g_st_sel[oeu + i];
+        int rc = ds4_gpu_offload_run_layer(
+                e->model.map, e->model.size,
+                layer->ffn_gate_exps->abs_offset, layer->ffn_up_exps->abs_offset,
+                layer->ffn_down_exps->abs_offset,
+                layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                (uint64_t)layer->ffn_gate_exps->dim[1] * routed_expert_row_bytes(layer->ffn_gate_exps),
+                routed_expert_row_bytes(layer->ffn_gate_exps),
+                (uint64_t)layer->ffn_down_exps->dim[1] * routed_expert_row_bytes(layer->ffn_down_exps),
+                routed_expert_row_bytes(layer->ffn_down_exps),
+                (uint32_t)layer->ffn_gate_exps->dim[0],
+                (uint32_t)layer->ffn_down_exps->dim[0],
+                (uint32_t)DS4_N_EMBD,
+                (uint32_t)DS4_N_EXPERT, (uint32_t)DS4_N_EXPERT_USED,
+                DS4_SWIGLU_CLAMP_EXP, g_st_layer,
+                ids, g_st_w + oeu, k, st_hid, st_out);
+        if (rc != 0) {
+            fprintf(stderr, "ds4: offload-selftest L=%d tok#%d offload_run_layer rc=%d\n",
+                    g_st_layer, t, rc);
+            continue;
+        }
+        float maxabs = 0.0f, maxref = 0.0f, sumabs = 0.0f;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+            _Float16 h; memcpy(&h, &st_out[i], sizeof(h));
+            st_of[i] = (float)h;
+            float d = st_of[i] - g_st_ref[off + i];
+            float ad = d < 0 ? -d : d;
+            if (ad > maxabs) maxabs = ad;
+            float ar = g_st_ref[off + i] < 0 ? -g_st_ref[off + i] : g_st_ref[off + i];
+            if (ar > maxref) maxref = ar;
+            sumabs += ad;
+        }
+        double rel = maxabs / (maxref + 1e-9);
+        if (rel > worst) worst = rel;
+        fprintf(stderr,
+                "ds4: offload-selftest L=%d tok#%d sel=[%d %d %d %d %d %d] "
+                "max_abs=%.6f mean_abs=%.6f max_rel=%.2e%s\n",
+                g_st_layer, t,
+                g_st_sel[oeu], g_st_sel[oeu + 1], g_st_sel[oeu + 2],
+                g_st_sel[oeu + 3], g_st_sel[oeu + 4], g_st_sel[oeu + 5],
+                maxabs, sumabs / DS4_N_EMBD, rel,
+                rel < 1e-2 ? "" : "  <-- over 1e-2");
+    }
+    fprintf(stderr,
+            "ds4: offload-selftest DONE layer=%d tokens=%d worst_max_rel=%.2e -> %s\n",
+            g_st_layer, g_st_done, worst,
+            worst < 1e-2 ? "PASS (matches decode within f16 wire noise)" :
+            "FAIL (check command-buffer lifecycle / x dtype)");
 }
 
 int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
