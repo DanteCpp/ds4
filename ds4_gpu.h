@@ -232,6 +232,24 @@ int ds4_gpu_offload_cache_install_expert(int layer, int expert,
                                          char *err, size_t errlen);
 void ds4_gpu_offload_cache_stats(uint32_t *resident, uint32_t *budget,
                                  uint32_t *slab_count, uint64_t *bytes_allocated);
+/* Compute the routing-weighted sum of k experts of `layer` on one hidden vector
+ * (n_embd f16 -> out_f16), reading the experts from the offload cache slabs via
+ * the slots6 IQ2/Q2_K kernels. Regime-independent (no mmap, no streaming cache).
+ * Returns 0 ok, 1 if a selected expert is not resident here, -1 on error. */
+int ds4_gpu_offload_cache_run_layer(uint32_t gate_type, uint32_t down_type,
+                                    uint64_t gate_row_bytes,
+                                    uint64_t gate_expert_bytes,
+                                    uint64_t down_row_bytes,
+                                    uint64_t down_expert_bytes,
+                                    uint32_t expert_in_dim,
+                                    uint32_t expert_mid_dim,
+                                    uint32_t out_dim,
+                                    uint32_t n_total_expert,
+                                    float clamp, int layer,
+                                    const uint16_t *expert_ids,
+                                    const float *weights, int k,
+                                    const uint16_t *hidden_f16,
+                                    uint16_t *out_f16);
 
 void ds4_gpu_print_memory_report(const char *label);
 

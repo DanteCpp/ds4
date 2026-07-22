@@ -27816,6 +27816,203 @@ static int ds4_gpu_encode_mul_mv_slots6_sum6(
     return 1;
 }
 
+/* =====================================================================
+ * Offload compute reading resident experts from the OFFLOAD cache (Unit #2).
+ *
+ * Binds the k selected experts' mlock'd offload-cache slab slots directly to
+ * the slots6 IQ2_XXS pair-swiglu + Q2_K sum6 kernels (the exact kernels the
+ * streaming decode uses at ds4_metal.m:37057/37394) and returns the routing-
+ * weighted expert sum. Unlike ds4_gpu_offload_run_layer, this does NOT go
+ * through the streaming-coupled routed_moe_one_tensor and does NOT read the
+ * mmap — it reads only the offload cache, so it is correct in any regime
+ * (streaming or full-residency). See EXPERT_OFFLOAD_TEST_RESULTS.md.
+ *
+ * Returns 0 on success, 1 if any selected expert is not resident in the offload
+ * cache (caller: that expert belongs to the peer), -1 on error.
+ * ===================================================================== */
+static ds4_gpu_tensor *g_offc_gate_scratch;    /* 6 * mid_dim f32 */
+static ds4_gpu_tensor *g_offc_up_scratch;      /* 6 * mid_dim f32 */
+static ds4_gpu_tensor *g_offc_mid_scratch;     /* 6 * mid_dim f32 */
+static ds4_gpu_tensor *g_offc_out_scratch;     /* out_dim  f32 */
+static ds4_gpu_tensor *g_offc_x_scratch;       /* in_dim   f32 */
+static ds4_gpu_tensor *g_offc_weights_scratch; /* 6        f32 */
+static uint32_t g_offc_scratch_mid, g_offc_scratch_out, g_offc_scratch_in;
+
+int ds4_gpu_offload_cache_run_layer(uint32_t gate_type, uint32_t down_type,
+                                    uint64_t gate_row_bytes,
+                                    uint64_t gate_expert_bytes,
+                                    uint64_t down_row_bytes,
+                                    uint64_t down_expert_bytes,
+                                    uint32_t expert_in_dim,
+                                    uint32_t expert_mid_dim,
+                                    uint32_t out_dim,
+                                    uint32_t n_total_expert,
+                                    float clamp, int layer,
+                                    const uint16_t *expert_ids,
+                                    const float *weights, int k,
+                                    const uint16_t *hidden_f16,
+                                    uint16_t *out_f16) {
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!expert_ids || !weights || !hidden_f16 || !out_f16) return -1;
+    if (!g_offload_expert_cache_active) return -1;
+    if (k <= 0 || k > 6 ||
+        expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
+        layer < 0 || layer >= DS4_OFFLOAD_N_LAYER) {
+        return -1;
+    }
+    /* The slots6 kernels this reuses are the IQ2_XXS gate/up + Q2_K down pair
+     * fixed at exactly 6 slots. */
+    if (gate_type != DS4_METAL_TENSOR_IQ2_XXS || down_type != DS4_METAL_TENSOR_Q2_K) {
+        return -1;
+    }
+    id<MTLComputePipelineState> pair_pipeline =
+        g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline;
+    id<MTLComputePipelineState> sum6_pipeline =
+        g_moe_mul_mv_slots6_q2_k_sum6_pipeline;
+    if (!pair_pipeline || !sum6_pipeline) return -1;
+
+    const uint32_t n_expert = 6; /* slots6 is fixed at 6; pad k up with weight 0 */
+
+    /* Resolve the 6 slot buffers from the offload cache. Pad the k requested
+     * experts up to 6 by repeating expert_ids[0] at weight 0 (its down output
+     * is scaled by 0 in the sum6, so the padding contributes nothing). */
+    __unsafe_unretained id<MTLBuffer> gate_bufs[6], up_bufs[6], down_bufs[6];
+    NSUInteger gate_offs[6], up_offs[6], down_offs[6];
+    float wpad[6];
+    for (uint32_t i = 0; i < n_expert; i++) {
+        const int id = (int)i < k ? (int)expert_ids[i] : (int)expert_ids[0];
+        if (id < 0 || id >= DS4_OFFLOAD_N_ROUTED) return -1;
+        ds4_gpu_offload_expert_entry *e = &g_offload_expert_cache[layer][id];
+        if (!e->valid) {
+            g_offload_expert_cache_misses++;
+            return 1; /* not resident on this node — belongs to the peer */
+        }
+        gate_bufs[i] = e->gate_buffer; gate_offs[i] = e->gate_inner;
+        up_bufs[i]   = e->up_buffer;   up_offs[i]   = e->up_inner;
+        down_bufs[i] = e->down_buffer; down_offs[i] = e->down_inner;
+        wpad[i] = (int)i < k ? weights[i] : 0.0f;
+        e->last_used++;
+        g_offload_expert_cache_hits++;
+    }
+
+    /* (Re)allocate persistent shared scratch sized to this model's dims. */
+    if (!g_offc_gate_scratch || g_offc_scratch_mid != expert_mid_dim ||
+        g_offc_scratch_out != out_dim || g_offc_scratch_in != expert_in_dim) {
+        g_offc_gate_scratch    = ds4_gpu_tensor_alloc((uint64_t)n_expert * expert_mid_dim * sizeof(float));
+        g_offc_up_scratch      = ds4_gpu_tensor_alloc((uint64_t)n_expert * expert_mid_dim * sizeof(float));
+        g_offc_mid_scratch     = ds4_gpu_tensor_alloc((uint64_t)n_expert * expert_mid_dim * sizeof(float));
+        g_offc_out_scratch     = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        g_offc_x_scratch       = ds4_gpu_tensor_alloc((uint64_t)expert_in_dim * sizeof(float));
+        g_offc_weights_scratch = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(float));
+        if (!g_offc_gate_scratch || !g_offc_up_scratch || !g_offc_mid_scratch ||
+            !g_offc_out_scratch || !g_offc_x_scratch || !g_offc_weights_scratch) {
+            return -1;
+        }
+        g_offc_scratch_mid = expert_mid_dim;
+        g_offc_scratch_out = out_dim;
+        g_offc_scratch_in = expert_in_dim;
+    }
+
+    /* x: f16 hidden -> f32 (the pair kernel consumes an f32 normalized hidden). */
+    {
+        float *x = malloc((size_t)expert_in_dim * sizeof(float));
+        if (!x) return -1;
+        for (uint32_t i = 0; i < expert_in_dim; i++) {
+            _Float16 h; memcpy(&h, &hidden_f16[i], sizeof(h));
+            x[i] = (float)h;
+        }
+        const int wrote = ds4_gpu_tensor_write(g_offc_x_scratch, 0, x,
+                                               (uint64_t)expert_in_dim * sizeof(float));
+        free(x);
+        if (!wrote) return -1;
+    }
+    if (!ds4_gpu_tensor_write(g_offc_weights_scratch, 0, wpad,
+                              (uint64_t)n_expert * sizeof(float))) {
+        return -1;
+    }
+
+    const uint32_t gate_nr0 = ds4_gpu_routed_mv_nr0(gate_type);
+    const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
+    if (gate_nr0 == 0 || down_nr0 == 0) return -1;
+
+    /* Same arg construction as the streaming slots6 path (ds4_metal.m:35214).
+     * tp_* stay 0 (no split, no addend) — this is a single-node compute. */
+    ds4_gpu_mul_mv_id_args gate_args =
+        ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                                    gate_row_bytes, gate_expert_bytes,
+                                    1, n_expert, 1, gate_nr0);
+    ds4_gpu_mul_mv_id_args down_args =
+        ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+                                    down_row_bytes, down_expert_bytes,
+                                    n_expert, n_expert, 1, down_nr0);
+    ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+        .width = expert_mid_dim,
+        .rows = n_expert, /* pair_rows = n_tokens(1) * n_expert(6) */
+        .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+        .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+        .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+        .weight_stride = sizeof(float),
+        .write_clamped = 0,
+        .clamp_value = clamp,
+    };
+    const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(gate_type);
+    const NSUInteger down_smem = ds4_gpu_routed_mv_smem(down_type);
+
+    id<MTLBuffer> xbuf       = ds4_gpu_tensor_buffer(g_offc_x_scratch);
+    id<MTLBuffer> gate_dst   = ds4_gpu_tensor_buffer(g_offc_gate_scratch);
+    id<MTLBuffer> up_dst     = ds4_gpu_tensor_buffer(g_offc_up_scratch);
+    id<MTLBuffer> mid_dst    = ds4_gpu_tensor_buffer(g_offc_mid_scratch);
+    id<MTLBuffer> out_dst    = ds4_gpu_tensor_buffer(g_offc_out_scratch);
+    id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(g_offc_weights_scratch);
+    if (!xbuf || !gate_dst || !up_dst || !mid_dst || !out_dst || !weightsbuf) {
+        return -1;
+    }
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return -1;
+
+    int ok = ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
+            cb, pair_pipeline, &gate_args, &act_args,
+            gate_bufs, gate_offs, up_bufs, up_offs,
+            xbuf, ds4_gpu_tensor_offset(g_offc_x_scratch),
+            gate_dst, ds4_gpu_tensor_offset(g_offc_gate_scratch),
+            up_dst, ds4_gpu_tensor_offset(g_offc_up_scratch),
+            mid_dst, ds4_gpu_tensor_offset(g_offc_mid_scratch),
+            weightsbuf, ds4_gpu_tensor_offset(g_offc_weights_scratch),
+            gate_smem, 2, false);
+    if (ok) {
+        ok = ds4_gpu_encode_mul_mv_slots6_sum6(
+                cb, sum6_pipeline, &down_args,
+                down_bufs, down_offs,
+                mid_dst, ds4_gpu_tensor_offset(g_offc_mid_scratch),
+                out_dst, ds4_gpu_tensor_offset(g_offc_out_scratch),
+                down_smem, 2);
+    }
+
+    if (owned) {
+        [cb commit];
+        if (ok) ok = ds4_gpu_wait_command_buffer(cb, "offload-cache-compute") != 0;
+    } else if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+    }
+    if (!ok) return -1;
+
+    float *o = malloc((size_t)out_dim * sizeof(float));
+    if (!o) return -1;
+    if (!ds4_gpu_tensor_read(g_offc_out_scratch, 0, o,
+                             (uint64_t)out_dim * sizeof(float))) {
+        free(o);
+        return -1;
+    }
+    for (uint32_t i = 0; i < out_dim; i++) {
+        _Float16 h = (_Float16)o[i];
+        memcpy(&out_f16[i], &h, sizeof(h));
+    }
+    free(o);
+    return 0;
+}
+
 static int ds4_gpu_encode_mul_mv_group6_pair_swiglu(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,

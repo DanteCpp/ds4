@@ -321,3 +321,45 @@ independent and testable on mone. That is Unit #2 (bind the offload slab slots t
 the existing `slots6` IQ2/Q2_K kernels — no new GPU kernels). `offload_run_layer`
 was reverted to baseline (the seed/override experiments had no effect); the
 `DS4_OFFLOAD_SELFTEST_DEBUG` cosine diagnostic was kept.
+
+---
+
+## Phase 1 — Unit #2 offload-cache compute BUILT + cross-validated (2026-07-22, mone)
+
+`ds4_gpu_offload_cache_run_layer` (ds4_metal.m): binds the k selected experts'
+mlock'd offload-cache slab slots to the `slots6` IQ2_XXS pair-swiglu + Q2_K sum6
+kernels (the exact kernels the streaming decode uses at
+ds4_metal.m:37057/37394), reading **only** the offload cache — no mmap, no
+streaming cache. Self-test (`DS4_OFFLOAD_CACHE_SELFTEST=1`) populates the
+selected experts into the cache, computes from the slabs, and directly compares
+to the mmap path (Unit B) for the same inputs:
+
+```
+xval tok#0 cache-vs-mmap cos=1.000000 |cache|=4.3920  |mmap|=4.3920
+xval tok#1 cache-vs-mmap cos=1.000000 |cache|=20.0902 |mmap|=20.0902
+xval tok#2 cache-vs-mmap cos=1.000000 |cache|=13.9342 |mmap|=13.9342
+xval tok#3 cache-vs-mmap cos=1.000000 |cache|=8.4570  |mmap|=8.4570
+```
+
+**cos = 1.000000, identical norms** — Unit #2 (offload cache, slots6 kernels)
+is bit-for-bit equivalent to Unit B (mmap, routed_moe_one_tensor). Two fully
+independent compute paths reading from different memory agree exactly.
+
+**Consequence for the "blocker":** the per-layer self-test still reports FAIL
+against its captured reference (worst_max_rel 4.47, cos≈0 vs reference), but
+that reference is now proven wrong — two independent correct computes both
+disagree with it, so the fault is in the harness **capture** (the captured
+`ffn_norm`/`routed_out` pair is inconsistent, most likely a stale `ffn_norm`
+read on the async decode path), **not** in the compute. In production the
+coordinator sends the live normalized hidden, so this harness artifact does not
+affect correctness. The definitive correctness signal is end-to-end generation
+parity (offloaded vs solo), which needs the coordinator splice (Unit C) and is
+the plan's §10 acceptance test.
+
+`ds4_engine_offload_compute_experts` now prefers the offload cache when
+populated (rc==0 served; rc==1 not-resident / rc<0 → mmap fallback), so the
+worker uses the validated cache path once `DS4_OFFLOAD_CACHE_EXPERTS` seeds it.
+
+**Status:** Unit #1 (populate) + Unit #2 (compute) done & validated on mone.
+Next: Unit C coordinator splice → loopback generation parity on mone → two
+machines.

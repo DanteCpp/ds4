@@ -56254,15 +56254,42 @@ void ds4_offload_selftest_finalize(ds4_engine *e) {
     if (g_st_layer >= ds4_engine_layer_count(e)) return;
     const ds4_layer_weights *layer = &e->weights.layer[g_st_layer];
     if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) return;
-    static uint16_t *st_hid = NULL, *st_out = NULL;
+    static uint16_t *st_hid = NULL, *st_out = NULL, *st_out2 = NULL;
     static float *st_of = NULL;
     if (!st_hid) {
-        st_hid = xmalloc((size_t)DS4_N_EMBD * sizeof(uint16_t));
-        st_out = xmalloc((size_t)DS4_N_EMBD * sizeof(uint16_t));
-        st_of  = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        st_hid  = xmalloc((size_t)DS4_N_EMBD * sizeof(uint16_t));
+        st_out  = xmalloc((size_t)DS4_N_EMBD * sizeof(uint16_t));
+        st_out2 = xmalloc((size_t)DS4_N_EMBD * sizeof(uint16_t));
+        st_of   = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     }
     const int k = DS4_N_EXPERT_USED;
     double worst = 0.0;
+
+    /* Per-expert byte/dim geometry (uniform across experts of this layer). */
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t gate_expert_bytes = (uint64_t)layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t down_expert_bytes = (uint64_t)layer->ffn_down_exps->dim[1] * down_row_bytes;
+    const uint64_t gate_off0 = layer->ffn_gate_exps->abs_offset;
+    const uint64_t up_off0   = layer->ffn_up_exps->abs_offset;
+    const uint64_t down_off0 = layer->ffn_down_exps->abs_offset;
+
+    /* DS4_OFFLOAD_CACHE_SELFTEST: exercise the offload-cache compute (Unit #2)
+     * instead of the streaming-coupled mmap compute — populate the selected
+     * experts into the mlock'd offload cache, then compute from those slabs. */
+    const int use_cache = getenv("DS4_OFFLOAD_CACHE_SELFTEST") != NULL;
+    if (use_cache) {
+        ds4_gpu_offload_cache_reset();
+        char cerr[160] = "";
+        if (ds4_gpu_offload_cache_configure(gate_expert_bytes, down_expert_bytes,
+                                            (uint32_t)(g_st_done * k + 8),
+                                            cerr, sizeof(cerr)) != 0) {
+            fprintf(stderr, "ds4: offload-cache-selftest: configure failed: %s\n", cerr);
+            return;
+        }
+        fprintf(stderr, "ds4: offload-cache-selftest: compute reads the offload cache (Unit #2)\n");
+    }
+
     for (int t = 0; t < g_st_done; t++) {
         const size_t off = (size_t)t * DS4_N_EMBD;
         const size_t oeu = (size_t)t * DS4_OFFLOAD_SELFTEST_MAX_EU;
@@ -56272,23 +56299,72 @@ void ds4_offload_selftest_finalize(ds4_engine *e) {
         }
         uint16_t ids[DS4_OFFLOAD_SELFTEST_MAX_EU];
         for (int i = 0; i < k; i++) ids[i] = (uint16_t)g_st_sel[oeu + i];
-        int rc = ds4_gpu_offload_run_layer(
-                e->model.map, e->model.size,
-                layer->ffn_gate_exps->abs_offset, layer->ffn_up_exps->abs_offset,
-                layer->ffn_down_exps->abs_offset,
-                layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
-                (uint64_t)layer->ffn_gate_exps->dim[1] * routed_expert_row_bytes(layer->ffn_gate_exps),
-                routed_expert_row_bytes(layer->ffn_gate_exps),
-                (uint64_t)layer->ffn_down_exps->dim[1] * routed_expert_row_bytes(layer->ffn_down_exps),
-                routed_expert_row_bytes(layer->ffn_down_exps),
-                (uint32_t)layer->ffn_gate_exps->dim[0],
-                (uint32_t)layer->ffn_down_exps->dim[0],
-                (uint32_t)DS4_N_EMBD,
-                (uint32_t)DS4_N_EXPERT, (uint32_t)DS4_N_EXPERT_USED,
-                DS4_SWIGLU_CLAMP_EXP, g_st_layer,
-                ids, g_st_w + oeu, k, st_hid, st_out);
+        int rc;
+        if (use_cache) {
+            char ierr[160] = "";
+            int install_ok = 1;
+            for (int i = 0; i < k && install_ok; i++) {
+                const int id = (int)ids[i];
+                if (ds4_gpu_offload_cache_install_expert(
+                        g_st_layer, id,
+                        gate_off0 + (uint64_t)id * gate_expert_bytes,
+                        up_off0   + (uint64_t)id * gate_expert_bytes,
+                        down_off0 + (uint64_t)id * down_expert_bytes,
+                        gate_expert_bytes, down_expert_bytes,
+                        ierr, sizeof(ierr)) < 0) {
+                    fprintf(stderr, "ds4: offload-cache-selftest: install L=%d id=%d failed: %s\n",
+                            g_st_layer, id, ierr);
+                    install_ok = 0;
+                }
+            }
+            if (!install_ok) continue;
+            rc = ds4_gpu_offload_cache_run_layer(
+                    layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                    gate_row_bytes, gate_expert_bytes, down_row_bytes, down_expert_bytes,
+                    (uint32_t)layer->ffn_gate_exps->dim[0],
+                    (uint32_t)layer->ffn_down_exps->dim[0],
+                    (uint32_t)DS4_N_EMBD, (uint32_t)DS4_N_EXPERT,
+                    DS4_SWIGLU_CLAMP_EXP, g_st_layer,
+                    ids, g_st_w + oeu, k, st_hid, st_out);
+            /* Cross-validate Unit #2 (offload cache) vs Unit B (mmap) directly:
+             * same inputs, two independent compute paths. cos ~ 1 proves they
+             * agree, isolating any reference divergence to the harness capture. */
+            if (rc == 0 &&
+                ds4_gpu_offload_run_layer(
+                    e->model.map, e->model.size, gate_off0, up_off0, down_off0,
+                    layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                    gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                    (uint32_t)layer->ffn_gate_exps->dim[0],
+                    (uint32_t)layer->ffn_down_exps->dim[0],
+                    (uint32_t)DS4_N_EMBD, (uint32_t)DS4_N_EXPERT, (uint32_t)DS4_N_EXPERT_USED,
+                    DS4_SWIGLU_CLAMP_EXP, g_st_layer,
+                    ids, g_st_w + oeu, k, st_hid, st_out2) == 0) {
+                double d = 0.0, na = 0.0, nb = 0.0;
+                for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+                    _Float16 a, b; memcpy(&a, &st_out[i], sizeof(a)); memcpy(&b, &st_out2[i], sizeof(b));
+                    d += (double)(float)a * (double)(float)b;
+                    na += (double)(float)a * (double)(float)a;
+                    nb += (double)(float)b * (double)(float)b;
+                }
+                fprintf(stderr, "ds4:   xval tok#%d cache-vs-mmap cos=%.6f |cache|=%.4f |mmap|=%.4f\n",
+                        t, d / (sqrt(na) * sqrt(nb) + 1e-12), sqrt(na), sqrt(nb));
+            }
+        } else {
+            rc = ds4_gpu_offload_run_layer(
+                    e->model.map, e->model.size,
+                    gate_off0, up_off0, down_off0,
+                    layer->ffn_gate_exps->type, layer->ffn_down_exps->type,
+                    gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes,
+                    (uint32_t)layer->ffn_gate_exps->dim[0],
+                    (uint32_t)layer->ffn_down_exps->dim[0],
+                    (uint32_t)DS4_N_EMBD,
+                    (uint32_t)DS4_N_EXPERT, (uint32_t)DS4_N_EXPERT_USED,
+                    DS4_SWIGLU_CLAMP_EXP, g_st_layer,
+                    ids, g_st_w + oeu, k, st_hid, st_out);
+        }
         if (rc != 0) {
-            fprintf(stderr, "ds4: offload-selftest L=%d tok#%d offload_run_layer rc=%d\n",
+            fprintf(stderr, "ds4: offload-selftest L=%d tok#%d compute rc=%d\n",
                     g_st_layer, t, rc);
             continue;
         }
@@ -56352,6 +56428,29 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
     if (gate_row_bytes == 0 || down_row_bytes == 0) return -1;
     const uint64_t gate_expert_bytes = l->ffn_gate_exps->dim[1] * gate_row_bytes;
     const uint64_t down_expert_bytes = l->ffn_down_exps->dim[1] * down_row_bytes;
+
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    /* Prefer the mlock'd offload cache when it is populated (Unit #2, validated
+     * cos=1.0 vs the mmap path). It reads only the resident slabs, so it is
+     * correct and fast in any regime. Fall back to the mmap path when the cache
+     * is empty or a requested expert is not resident here (rc==1). */
+    {
+        uint32_t resident = 0;
+        ds4_gpu_offload_cache_stats(&resident, NULL, NULL, NULL);
+        if (resident > 0) {
+            const int rc = ds4_gpu_offload_cache_run_layer(
+                    l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                    gate_row_bytes, gate_expert_bytes, down_row_bytes, down_expert_bytes,
+                    (uint32_t)l->ffn_gate_exps->dim[0],
+                    (uint32_t)l->ffn_down_exps->dim[0],
+                    (uint32_t)DS4_N_EMBD, (uint32_t)DS4_N_EXPERT,
+                    DS4_SWIGLU_CLAMP_EXP, layer,
+                    expert_ids, weights, k, hidden_f16, out_f16);
+            if (rc == 0) return 0;      /* served from the offload cache */
+            /* rc==1 (expert not resident) or rc<0: fall through to mmap. */
+        }
+    }
+#endif
 
     return ds4_gpu_offload_run_layer(
             e->model.map, e->model.size,
