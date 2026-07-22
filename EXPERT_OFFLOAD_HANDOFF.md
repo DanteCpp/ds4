@@ -68,7 +68,7 @@ and its siblings at 23009/23090/23271/23477/23569. Gate everything on a new
 `cfg.offload.host` is set: build HELLO via `cli_offload_hello(engine)`, call
 `ds4_offload_client_connect(host, port, &hello, timeout, ...)`, stash the client
 on the engine (new field). Close it on shutdown. Fall back to solo streaming if
-connect fails (Phase 4 graceful degrade).
+connect fails (Phase 3 graceful degrade).
 
 **Residency table.** Build `ds4_offload_residency` from the partition: seed the
 hottest ~64% of experts/layer (from `ds4_streaming_hotlist.inc`) as resident on
@@ -121,15 +121,11 @@ currently NULL in `run_offload_worker`). No ACK; accept the rare Y-race, or add
 lazy eviction with a small spare-slot pool (plan §6). Extend
 `g_stream_expert_cache_*` telemetry for swap/hit rates.
 
-## Step 5 — Phase 3 (MTP) / Phase 4 (robustness)
+## Step 5 — Phase 3 (robustness)
 
-- MTP: draft with the `nextn_predict_layers=1` head, batch all draft-row
-  `EXPERT_REQ`s for a layer into one round trip (`k` rows/frame — extend the
-  wire format with a row count). Accept/rollback on the coordinator; worker
-  stays stateless.
-- Robustness: worker-drop → solo streaming fallback; jumbo-frame (`mtu 9000`)
-  setup + autodetect on `bridge0`; verify `SO_SNDBUF`/`SO_RCVBUF`/`TCP_NODELAY`
-  under load (already set in `off_socket_tune`).
+- Worker-drop → solo streaming fallback; jumbo-frame (`mtu 9000`) setup +
+  autodetect on `bridge0`; verify `SO_SNDBUF`/`SO_RCVBUF`/`TCP_NODELAY` under
+  load (already set in `off_socket_tune`).
 
 ## Key symbols / locations
 

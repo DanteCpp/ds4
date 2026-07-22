@@ -35,7 +35,6 @@ Status: design. Target hardware: **mone** (M1 Max, 64 GB, coordinator) +
 | Expert FFN length | 2048 |
 | Hidden size (`embedding_length`) | 4096 → **activation vector = 8 KB @ fp16** |
 | Attention heads / KV heads | 64 / 1 (MLA — tiny KV cache) |
-| MTP head (`nextn_predict_layers`) | 1 (self-speculative decoding available) |
 
 | Tensor group | Size | Notes |
 |---|---|---|
@@ -269,18 +268,10 @@ stable, so swaps are rare after warm-up. Seed the initial partition from
 ## 7. Latency hiding
 
 The MoE residual chain is sequential, so each miss-layer adds a round trip on the
-critical path. Two mechanisms hide it:
-
-1. **Overlap (phase 1).** Fire the worker request *before* computing mone's local
-   experts. mone's ~5 local experts/layer (~130 µs of GPU work) run concurrently
-   with the worker RTT. Fully hidden when `local_compute ≥ RTT`; otherwise the
-   uncovered remainder is the tax.
-2. **MTP self-speculative decoding (phase 3).** The model ships an MTP head
-   (`nextn_predict_layers = 1`). Drafting/verifying several tokens per step lets
-   the coordinator batch the remote expert requests for all draft rows into one
-   round trip per layer, hiding the RTT behind independent work even when
-   per-token overlap can't. This is a model feature independent of TP; implement
-   it directly on `ds4_offload` (batched `EXPERT_REQ`), not via `ds4_tp`.
+critical path. **Overlap** hides it: fire the worker request *before* computing
+mone's local experts. mone's ~5 local experts/layer (~130 µs of GPU work) run
+concurrently with the worker RTT. Fully hidden when `local_compute ≥ RTT`;
+otherwise the uncovered remainder is the tax.
 
 ### Projected throughput
 
@@ -391,13 +382,7 @@ collects `EXPERT_RESP` by `seq` so per-layer requests can overlap local compute.
 - [ ] (If the Y-race bites) add lazy eviction with a small spare-slot pool (§6).
 - **Exit:** hit rate holds >85% across topic shifts; no critical-path SSD reads.
 
-**Phase 3 — Latency hiding via MTP (2 days, optional).**
-- [ ] Draft with the MTP head; batch all draft-row `EXPERT_REQ`s for a layer into
-      one round trip (`k` rows per frame).
-- [ ] Accept/rollback on the coordinator (self-contained; worker stays stateless).
-- **Exit:** approach the ~33 t/s compute ceiling even at ~1 ms RTT.
-
-**Phase 4 — Robustness.**
+**Phase 3 — Robustness.**
 - [ ] Worker-drop fallback to solo SSD-streaming (graceful degrade).
 - [ ] Jumbo-frame (`mtu 9000`) setup doc + auto-detect on `bridge0`.
 - [ ] Socket tuning (`SO_SNDBUF`/`SO_RCVBUF`, `TCP_NODELAY`) verified under load.
@@ -421,13 +406,13 @@ collects `EXPERT_RESP` by `seq` so per-layer requests can overlap local compute.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Real RTT ≫ 0.47 ms | Worker tax dominates, < 15 t/s | Phase 0 gate; jumbo MTU; `TCP_NODELAY`; MTP hiding (Phase 3) |
+| Real RTT ≫ 0.47 ms | Worker tax dominates, < 15 t/s | Phase 0 gate; jumbo MTU; `TCP_NODELAY`; per-token overlap (§7) |
 | Wired-limit pressure / OS swap | Thrash, stalls | Conservative ceilings (§2); stream `token_embd`; monitor compressor |
 | Swap thrash on topic shift | Wire/SSD churn | Warm-start from hotlist; swaps are background; hit rate self-stabilizes |
 | Y-race after ACK-less swap | Rare slow token (Y = LRU tail, unlikely re-request) | Accepted; optional lazy eviction w/ spare slots (§6) |
 | Both SSDs page per promotion | Background read pressure | Both SSDs idle during inference; measure vs device budget (§6) |
 | TCP latency variance / Nagle | Jittery tax | `TCP_NODELAY`, one persistent socket, no per-request connect |
-| Worker failure mid-run | Hang | Phase 4 fallback to solo streaming |
+| Worker failure mid-run | Hang | Phase 3 fallback to solo streaming |
 
 ---
 
