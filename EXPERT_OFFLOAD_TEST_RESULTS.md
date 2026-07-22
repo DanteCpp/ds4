@@ -268,3 +268,56 @@ must be fixed before the splice is meaningful.
    `ds4_metal.m:34740+` (~5000-line function): the decode uses
    `begin_selected_load` + the selected-override; the offload clears the
    override and reads direct. Selection matches; the compute differs.
+
+---
+
+## Phase 1 — Unit-B self-test, root-caused (2026-07-22, mone)
+
+Re-ran the capture+replay self-test on mone (M1 Max 64 GB, `iogpu.wired_limit_mb`
+already 57344) with the model in SSD-streaming mode:
+
+```sh
+DS4_OFFLOAD_SELFTEST_LAYER=3 DS4_OFFLOAD_SELFTEST_TOKENS=4 \
+  ./ds4 -m ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 256 \
+        -p "The capital of France is" -n 6 --temp 0
+```
+
+**Result: FAIL, and now root-caused.** Added a cosine/norm diagnostic
+(`DS4_OFFLOAD_SELFTEST_DEBUG=1`, finalize in `ds4.c`):
+
+| tok | \|offload\| | \|ref\| | cosine | ratio |
+|-----|-------------|---------|--------|-------|
+| 0   | 4.39        | 177.69  | 0.23   | 0.02  |
+| 1   | 20.09       | 6.45    | 0.01   | 3.11  |
+| 2   | 13.93       | 10.42   | 0.08   | 1.34  |
+| 3   | 8.46        | 8.63    | 0.05   | 0.98  |
+
+**The offload output is orthogonal to the decode reference (cos ≈ 0), not a
+scaled/shifted version.** Since capture grabs `ffn_norm`, `router_selected`,
+`router_weights`, `routed_out` at one consistent point, and the offload output
+*does* vary per token (so the hidden vector is being consumed), the only
+explanation is that **the offload compute reads the wrong expert weights.**
+
+Ruled out by experiment (each a full model-load run; all byte-identical output):
+- Loading the experts into the streaming cache first via the async
+  `begin_selected_load` → no change.
+- Same via the synchronous `ds4_gpu_stream_expert_cache_seed_selected` → no change.
+- Forcing the mmap path (`DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS=1`) →
+  hard fail: *"Metal model range … is not covered by mapped model views"* — in
+  streaming mode only `token_embd` is mmap'd; **the routed experts are not in the
+  mmap at all**, only in the streaming slab cache.
+
+**Conclusion.** Reusing the streaming-coupled `ds4_gpu_routed_moe_one_tensor`
+for the offload worker is the wrong foundation: in `--ssd-streaming` the experts
+live only in the streaming slab cache, and that cache is not reliably populated
+for the selected experts at the standalone (post-generation / worker) call site,
+so the compute reads garbage. This is regime-specific, not a kernel bug — the
+same code computes the decode correctly *inside* the graph.
+
+**Fix (the intended architecture):** the offload compute must read experts from
+the **populated offload cache** (`g_offload_expert_cache_*`, mlock'd, filled from
+the GGUF at startup — the populate landed this session), which is regime-
+independent and testable on mone. That is Unit #2 (bind the offload slab slots to
+the existing `slots6` IQ2/Q2_K kernels — no new GPU kernels). `offload_run_layer`
+was reverted to baseline (the seed/override experiments had no effect); the
+`DS4_OFFLOAD_SELFTEST_DEBUG` cosine diagnostic was kept.

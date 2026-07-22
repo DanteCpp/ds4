@@ -16,9 +16,22 @@ Status: design. Target hardware: **mone** (M1 Max, 64 GB, coordinator) +
 > not support RDMA, so the only transport is **plain TCP over Thunderbolt**
 > (`bridge0`, `TCP_NODELAY`, jumbo frames). This mode is an asymmetric
 > coordinator + expert-compute-server; the worker is not a parallel rank and
-> never runs the model graph. The reusable core is the **SSD-streaming LRU
-> expert cache**, with its "missing expert" data source swapped from the local
-> SSD to the peer.
+> never runs the model graph. The reusable core is the **LRU expert cache
+> *discipline*** proven by the SSD-streaming cache — promote-on-touch, evict the
+> coldest — applied to a **separate, RAM-resident (mlock'd) offload cache**, not
+> the SSD-streaming cache instance itself. Its "missing expert" data source is
+> the peer, not the local SSD.
+
+> **Architecture note (LRU, clarified).** Earlier drafts implied *reusing the
+> SSD-streaming cache instance* (`g_stream_expert_cache_*`) and merely redirecting
+> its miss branch. That is **not** the intent. The offload feature has its **own**
+> expert cache (`g_offload_expert_cache_*` in `ds4_metal.m`), separate from the
+> SSD-streaming cache, populated from the GGUF into mlock'd slabs at startup
+> (§5.1). What is reused is the **LRU policy**, not the data structure: the
+> coldest experts are evicted and touched experts promoted, exactly as the
+> streaming cache does. Startup fills it statically (warm-started from the
+> hotlist); Phase 2 (§6) makes it a live LRU with promote-on-hit + background
+> eviction.
 
 ---
 
@@ -121,14 +134,17 @@ TP worker (§4).
 
 ## 4. Reuse map — build on SSD-streaming, not TP
 
-The reusable core is the **SSD-streaming LRU expert cache**. The `ds4_tp`
+The reusable core is the **LRU expert-cache discipline** proven by the
+SSD-streaming cache — not the streaming cache *instance*. The offload feature
+owns a **separate** cache (`g_offload_expert_cache_*`), mlock'd and RAM-resident,
+that follows the same LRU policy (evict coldest, promote touched). The `ds4_tp`
 (tensor-parallel / RDMA / M5) module is deliberately **not** used — its lockstep
 full-graph model and RDMA slab are the wrong shape for M1/M2. The transport is a
-**new, small, plain-TCP module** (call it `ds4_offload.c`).
+**new, small, plain-TCP module** (`ds4_offload.c`).
 
 | Need | Existing code | Reuse / change |
 |---|---|---|
-| Dynamic LRU expert cache | `g_stream_expert_cache_*` clock-LRU in `ds4_metal.m`; `split_resident` / `split_missing` per-layer split; hotness decay | **Core reuse.** Keep the LRU; **redirect the `split_missing` branch** from SSD `pread` to a worker request |
+| Dynamic LRU expert cache | `g_stream_expert_cache_*` clock-LRU in `ds4_metal.m`; `split_resident` / `split_missing` per-layer split; hotness decay | **Reuse the LRU *policy*, in a separate cache.** New `g_offload_expert_cache_*` (mlock'd slabs, §5.1); the `split_missing` branch requests the expert from the **peer**, not SSD |
 | Per-expert skip in shader | the per-expert ownership predicate used by the MoE kernels in `metal/moe.metal` | Reuse the *mechanism* as a **residency check** ("is this expert resident locally?") — a generic bitmap test, not TP ownership |
 | Cache sizing / mlock | `ds4_ssd.c` (`ds4_ssd_auto_cache_plan`, `ds4_ssd_memory_lock_acquire`) | Extend to the asymmetric two-node budget in §2 |
 | Warm-start hot set | `ds4_streaming_hotlist.inc` (+ profiler in `ds4.c:1304`) | Seed the initial mone/mtwo partition from the precomputed hotlist |

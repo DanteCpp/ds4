@@ -3705,7 +3705,18 @@ int ds4_gpu_offload_run_layer(const void *model_map, uint64_t model_size,
     }
 
     /* We supply the selection explicitly; make sure no stale GPU-router
-     * override shadows it. */
+     * override shadows it.
+     *
+     * NOTE (Unit-B divergence, investigated 2026-07-22): reusing the
+     * streaming-coupled routed_moe_one_tensor here is the wrong foundation for
+     * the offload worker. In --ssd-streaming mode the routed experts are not in
+     * the mmap and the slab-cache path does not reliably hold them at the
+     * standalone (post-generation) call site, so this compute reads the wrong
+     * expert weights — the self-test output is orthogonal (cos≈0) to the decode
+     * reference regardless of any seed/override we add here. The fix is to make
+     * the offload compute read from the populated offload cache
+     * (g_offload_expert_cache_*), which is regime-independent; see
+     * EXPERT_OFFLOAD_TEST_RESULTS.md. */
     ds4_gpu_routed_moe_set_selected_override(NULL, 0);
 
     int ok = ds4_gpu_routed_moe_one_tensor(

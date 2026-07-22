@@ -56293,6 +56293,7 @@ void ds4_offload_selftest_finalize(ds4_engine *e) {
             continue;
         }
         float maxabs = 0.0f, maxref = 0.0f, sumabs = 0.0f;
+        double dot = 0.0, nof = 0.0, nref = 0.0;
         for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
             _Float16 h; memcpy(&h, &st_out[i], sizeof(h));
             st_of[i] = (float)h;
@@ -56302,8 +56303,21 @@ void ds4_offload_selftest_finalize(ds4_engine *e) {
             float ar = g_st_ref[off + i] < 0 ? -g_st_ref[off + i] : g_st_ref[off + i];
             if (ar > maxref) maxref = ar;
             sumabs += ad;
+            dot += (double)st_of[i] * (double)g_st_ref[off + i];
+            nof += (double)st_of[i] * (double)st_of[i];
+            nref += (double)g_st_ref[off + i] * (double)g_st_ref[off + i];
         }
         double rel = maxabs / (maxref + 1e-9);
+        if (getenv("DS4_OFFLOAD_SELFTEST_DEBUG")) {
+            double cos = dot / (sqrt(nof) * sqrt(nref) + 1e-12);
+            fprintf(stderr,
+                    "ds4:   dbg tok#%d |off|=%.4f |ref|=%.4f cos=%.4f "
+                    "ratio=%.4f  off[0..3]=%.4f %.4f %.4f %.4f  ref[0..3]=%.4f %.4f %.4f %.4f\n",
+                    t, sqrt(nof), sqrt(nref), cos,
+                    sqrt(nof) / (sqrt(nref) + 1e-12),
+                    st_of[0], st_of[1], st_of[2], st_of[3],
+                    g_st_ref[off + 0], g_st_ref[off + 1], g_st_ref[off + 2], g_st_ref[off + 3]);
+        }
         if (rel > worst) worst = rel;
         fprintf(stderr,
                 "ds4: offload-selftest L=%d tok#%d sel=[%d %d %d %d %d %d] "
