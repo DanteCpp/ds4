@@ -118,6 +118,25 @@ typedef struct {
 } ds4_offload_hello;
 
 /* ------------------------------------------------------------------------
+ * Session debug log (diagnostic). Same "ds4: ..." line style as the rest of
+ * the codebase, written to a file with a monotonic millisecond timestamp so a
+ * distributed run can be analyzed post-hoc and correlated across the two
+ * machines: per layer, per token, which experts were served from local RAM,
+ * from the worker over the wire (and its latency), or streamed from SSD.
+ * --------------------------------------------------------------------- */
+typedef struct ds4_offload_log ds4_offload_log;
+
+/* Open the log in append mode. Returns NULL on failure (a diagnostic never
+ * aborts the run). */
+ds4_offload_log *ds4_offload_log_open(const char *path);
+void ds4_offload_log_close(ds4_offload_log *l);
+/* "ds4: [t=+<ms>] <fmt>" to the file (flushed every line) AND stderr — for
+ * low-volume lifecycle lines (orchestration, token summaries, totals). */
+void ds4_offload_logf(ds4_offload_log *l, const char *fmt, ...);
+/* File-only variant for the high-volume per-layer / per-request stream. */
+void ds4_offload_logf_file(ds4_offload_log *l, const char *fmt, ...);
+
+/* ------------------------------------------------------------------------
  * Residency table (§5.1). Authoritative on the coordinator: which experts of
  * each layer are held locally (in mone's LRU). 43 x 256 bits = 1.4 KB.
  * --------------------------------------------------------------------- */
@@ -257,6 +276,7 @@ typedef struct {
     ds4_offload_expert_evict_fn evict; /* may be NULL                        */
     ds4_offload_plan_fn plan;          /* may be NULL (reject orchestration) */
     ds4_offload_worker_diag_fn diag;   /* may be NULL (per-token log suffix) */
+    ds4_offload_log *log;              /* may be NULL (session debug log)     */
     void *user;
     volatile int *stop;         /* set non-zero from another thread to exit  */
 } ds4_offload_worker_options;

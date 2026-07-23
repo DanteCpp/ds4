@@ -21558,6 +21558,75 @@ static int offload_fetch_remote_partial(ds4_engine *e, int layer,
     return ds4_engine_offload_compute_experts(e, layer, ids, w, k, hidden_f16, out16);
 }
 
+/* Coordinator session log: per-layer serving origin and per-token summaries.
+ * One token = one increasing run of layer indices through the decode splice;
+ * a wrap flushes the previous token. Per layer we record which experts were
+ * served from local RAM (the streaming cache / hot tier), which from the
+ * worker over the wire (and the round-trip latency), and how many had to be
+ * read from SSD — the streaming-cache miss delta across the layer's local
+ * compute (may include background readahead noise). */
+static struct {
+    uint64_t tok_no;
+    int open, prev_layer;
+    int layers, sel, local, net, ssd, net_fail;
+    double net_ms;
+} g_offload_toklog = { .prev_layer = -1 };
+
+static void offload_toklog_flush(ds4_offload_log *l) {
+    if (!l || !g_offload_toklog.open) return;
+    ds4_offload_logf(l,
+        "tok#%llu done: layers=%d sel=%d local=%d net=%d ssd=%d "
+        "net_ms=%.2f (%.2f ms/net-layer) net_fail=%d",
+        (unsigned long long)g_offload_toklog.tok_no,
+        g_offload_toklog.layers, g_offload_toklog.sel,
+        g_offload_toklog.local, g_offload_toklog.net, g_offload_toklog.ssd,
+        g_offload_toklog.net_ms,
+        g_offload_toklog.net > 0
+            ? g_offload_toklog.net_ms / g_offload_toklog.net : 0.0,
+        g_offload_toklog.net_fail);
+    g_offload_toklog.tok_no++;
+    g_offload_toklog.open = 0;
+    g_offload_toklog.prev_layer = -1;
+    g_offload_toklog.layers = g_offload_toklog.sel = 0;
+    g_offload_toklog.local = g_offload_toklog.net = 0;
+    g_offload_toklog.ssd = g_offload_toklog.net_fail = 0;
+    g_offload_toklog.net_ms = 0.0;
+}
+
+static void offload_log_layer(ds4_offload_log *l, uint32_t layer_index,
+                              const uint16_t *ids, int n,
+                              const uint8_t *local_idx, int n_local,
+                              const uint8_t *remote_idx, int n_remote,
+                              double net_ms, uint64_t ssd_delta,
+                              int net_failed) {
+    if (!l) return;
+    if (g_offload_toklog.open && (int)layer_index <= g_offload_toklog.prev_layer)
+        offload_toklog_flush(l);
+    g_offload_toklog.open = 1;
+    g_offload_toklog.prev_layer = (int)layer_index;
+    g_offload_toklog.layers++;
+    g_offload_toklog.sel += n;
+    g_offload_toklog.local += n_local;
+    g_offload_toklog.net += n_remote;
+    g_offload_toklog.ssd += (int)ssd_delta;
+    g_offload_toklog.net_fail += net_failed ? 1 : 0;
+    g_offload_toklog.net_ms += net_ms;
+
+    char lids[80], rids[80];
+    size_t lo = 0, ro = 0;
+    for (int i = 0; i < n_local; i++)
+        lo += (size_t)snprintf(lids + lo, sizeof(lids) - lo, "%s%u",
+                               i ? "," : "", (unsigned)ids[local_idx[i]]);
+    for (int i = 0; i < n_remote; i++)
+        ro += (size_t)snprintf(rids + ro, sizeof(rids) - ro, "%s%u",
+                               i ? "," : "", (unsigned)ids[remote_idx[i]]);
+    ds4_offload_logf_file(l,
+        "tok#%llu L%u sel=%d local=[%s] net=[%s] net_ms=%.2f ssd=%llu%s",
+        (unsigned long long)g_offload_toklog.tok_no, layer_index, n,
+        lids, rids, net_ms, (unsigned long long)ssd_delta,
+        net_failed ? " NET-FAIL(local-fallback)" : "");
+}
+
 /* See the block comment above. Signature is identical to
  * ds4_gpu_routed_moe_one_tensor so the streaming call sites just rename to it. */
 static int metal_graph_routed_moe_or_offload(
@@ -21590,6 +21659,12 @@ static int metal_graph_routed_moe_or_offload(
         return OFFLOAD_PASSTHROUGH();
     }
 
+    /* Session log: snapshot the streaming-cache counters; the miss delta over
+     * the local compute below attributes this layer's SSD reads. */
+    ds4_offload_log *olog = ds4_engine_offload_log(e);
+    uint64_t slog_m0 = 0, slog_h0 = 0;
+    if (olog) ds4_gpu_stream_expert_cache_hitmiss(&slog_h0, &slog_m0);
+
     /* Commit pending work so the router selection + normalized hidden are
      * host-readable (same sync the CPU-router path performs). */
     if (ds4_gpu_end_commands() == 0) return OFFLOAD_PASSTHROUGH();
@@ -21614,7 +21689,17 @@ static int metal_graph_routed_moe_or_offload(
 
     if (n_remote == 0) {          /* all experts resident: plain local compute */
         if (ds4_gpu_begin_commands() == 0) return 0;
-        return OFFLOAD_PASSTHROUGH();
+        const int rc = OFFLOAD_PASSTHROUGH();
+        if (olog) {
+            uint64_t h1 = 0, m1 = 0;
+            ds4_gpu_stream_expert_cache_hitmiss(&h1, &m1);
+            uint8_t all_idx[DS4_OFFLOAD_N_USED];
+            for (uint32_t i = 0; i < n_expert; i++) all_idx[i] = (uint8_t)i;
+            offload_log_layer(olog, layer_index, ids16, (int)n_expert,
+                              all_idx, (int)n_expert, NULL, 0,
+                              0.0, m1 - slog_m0, 0);
+        }
+        return rc;
     }
     if (getenv("DS4_OFFLOAD_DEBUG")) {
         static uint64_t fired;
@@ -21628,11 +21713,25 @@ static int metal_graph_routed_moe_or_offload(
     offload_f32_to_f16(norm, hidden16, DS4_OFFLOAD_N_EMBD);
 
     uint16_t partial16[DS4_OFFLOAD_N_EMBD];
-    if (offload_fetch_remote_partial(e, (int)layer_index, rids, rw, n_remote,
-                                     hidden16, partial16) != 0) {
+    const double net_t0 = olog ? now_sec() : 0.0;
+    const int fetch_rc = offload_fetch_remote_partial(e, (int)layer_index,
+                                                      rids, rw, n_remote,
+                                                      hidden16, partial16);
+    const double net_ms = olog ? (now_sec() - net_t0) * 1000.0 : 0.0;
+    if (fetch_rc != 0) {
         /* Worker drop / error: full local compute is still correct (§Phase-3). */
         if (ds4_gpu_begin_commands() == 0) return 0;
-        return OFFLOAD_PASSTHROUGH();
+        const int rc = OFFLOAD_PASSTHROUGH();
+        if (olog) {
+            uint64_t h1 = 0, m1 = 0;
+            ds4_gpu_stream_expert_cache_hitmiss(&h1, &m1);
+            uint8_t all_idx[DS4_OFFLOAD_N_USED];
+            for (uint32_t i = 0; i < n_expert; i++) all_idx[i] = (uint8_t)i;
+            offload_log_layer(olog, layer_index, ids16, (int)n_expert,
+                              all_idx, (int)n_expert, NULL, 0,
+                              net_ms, m1 - slog_m0, 1);
+        }
+        return rc;
     }
 
     /* Zero the remote experts' weights so the local kernel contributes only the
@@ -21672,7 +21771,15 @@ static int metal_graph_routed_moe_or_offload(
         n_total_expert, n_expert, clamp, x, NULL, layer_index, force_resident);
     if (rc == 0) return 0;
     /* out += worker's remote partial (queued GPU add, same command stream). */
-    return ds4_gpu_add_tensor(out, out, partial_t, DS4_OFFLOAD_N_EMBD);
+    rc = ds4_gpu_add_tensor(out, out, partial_t, DS4_OFFLOAD_N_EMBD);
+    if (olog) {
+        uint64_t h1 = 0, m1 = 0;
+        ds4_gpu_stream_expert_cache_hitmiss(&h1, &m1);
+        offload_log_layer(olog, layer_index, ids16, (int)n_expert,
+                          local_idx, n_local, remote_idx, n_remote,
+                          net_ms, m1 - slog_m0, 0);
+    }
+    return rc;
 #undef OFFLOAD_PASSTHROUGH
 }
 
@@ -35605,10 +35712,13 @@ struct ds4_engine {
 
     /* Distributed expert offload (coordinator side). offload_active gates the
      * decode splice; offload_client is the persistent worker connection;
-     * offload_residency is the per-layer local/remote expert partition. */
+     * offload_residency is the per-layer local/remote expert partition.
+     * offload_log is the optional session debug log (borrowed, owned by the
+     * caller): per-layer serving origin + per-token summaries. */
     ds4_offload_client   *offload_client;
     bool                  offload_active;
     ds4_offload_residency offload_residency;
+    ds4_offload_log      *offload_log;
 };
 
 static uint64_t glm_graph_wired_limit_bytes(void);   /* fwd: defined below */
@@ -35792,6 +35902,14 @@ const ds4_offload_residency *ds4_engine_offload_residency(const ds4_engine *e) {
 
 void ds4_engine_offload_set_residency(ds4_engine *e, const ds4_offload_residency *r) {
     if (e && r) e->offload_residency = *r;
+}
+
+void ds4_engine_offload_set_log(ds4_engine *e, ds4_offload_log *l) {
+    if (e) e->offload_log = l;
+}
+
+ds4_offload_log *ds4_engine_offload_log(const ds4_engine *e) {
+    return e ? e->offload_log : NULL;
 }
 
 static uint64_t ds4_engine_dynamic_expert_cache_bytes(
@@ -57319,6 +57437,10 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#ifndef DS4_NO_GPU
+    /* close out the last open token in the session log */
+    offload_toklog_flush(ds4_engine_offload_log(e));
+#endif
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();

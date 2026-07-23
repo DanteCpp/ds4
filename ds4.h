@@ -319,6 +319,12 @@ void ds4_engine_offload_set_residency(ds4_engine *e, const ds4_offload_residency
  * (a miss in steady state means the cache does not hold what the coordinator
  * asked for — i.e. the cache is not updating/installed correctly). */
 void ds4_engine_offload_cache_diag(ds4_engine *e, char *buf, size_t len);
+/* Attach a session debug log (borrowed; the caller opens/closes it). When
+ * set, the coordinator's decode splice logs, per layer: which experts were
+ * served from local RAM, which from the worker (with the wire latency), how
+ * many had to be read from SSD; plus per-token summaries. */
+void ds4_engine_offload_set_log(ds4_engine *e, ds4_offload_log *l);
+ds4_offload_log *ds4_engine_offload_log(const ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);

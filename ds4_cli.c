@@ -96,6 +96,7 @@ typedef struct {
     bool worker;            /* --expert-server : run the expert-compute server */
     const char *host;       /* --expert-offload <host> : coordinator dials this */
     const char *bind;       /* --expert-offload-bind <ip> : worker bind address */
+    const char *log_path;   /* --expert-offload-log <file> : session debug log */
     int port;               /* --expert-offload-port <n> (0 = default)         */
 } cli_offload_options;
 
@@ -152,6 +153,25 @@ static int cli_offload_plan(void *user, uint32_t coord_cap,
     return ds4_engine_offload_apply_plan((ds4_engine *)user, coord_cap, plan,
                                          count, installed, wired_bytes,
                                          err, errlen);
+}
+
+/* Session debug log (--expert-offload-log): opened lazily, closed at exit.
+ * Both roles share the opener; the coordinator also passes it to the engine
+ * (ds4_engine_offload_set_log) so the decode splice logs per-layer serving. */
+static ds4_offload_log *cli_offload_log;
+static void cli_offload_log_atexit(void) {
+    ds4_offload_log_close(cli_offload_log);
+    cli_offload_log = NULL;
+}
+static ds4_offload_log *cli_offload_log_open_once(const char *path) {
+    if (!cli_offload_log && path && path[0]) {
+        cli_offload_log = ds4_offload_log_open(path);
+        if (cli_offload_log) {
+            atexit(cli_offload_log_atexit);
+            fprintf(stderr, "ds4: expert-offload: session log -> %s\n", path);
+        }
+    }
+    return cli_offload_log;
 }
 
 static volatile int cli_offload_stop;
@@ -215,6 +235,7 @@ static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
     opt.evict = NULL;                 /* Phase-2 dynamic swaps: not yet */
     opt.plan = cli_offload_plan;
     opt.diag = cli_offload_diag;
+    opt.log = cli_offload_log_open_once(cfg->offload.log_path);
     opt.user = engine;
     opt.stop = &cli_offload_stop;
     char err[256] = "";
@@ -2007,6 +2028,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.offload.bind = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-offload-port")) {
             c.offload.port = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--expert-offload-log")) {
+            c.offload.log_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -2338,6 +2361,14 @@ int main(int argc, char **argv) {
      * it. On any failure we fall back to solo streaming (graceful degrade). */
     ds4_offload_client *offload_cli = NULL;
     if (cfg.offload.host && cfg.offload.host[0]) {
+        ds4_offload_log *olog = cli_offload_log_open_once(cfg.offload.log_path);
+        if (olog) {
+            ds4_engine_offload_set_log(engine, olog);
+            ds4_offload_logf(olog, "coordinator starting; worker=%s:%d",
+                             cfg.offload.host,
+                             cfg.offload.port ? cfg.offload.port
+                                              : DS4_OFFLOAD_DEFAULT_PORT);
+        }
         ds4_offload_hello hello = cli_offload_hello(engine);
         hello.mem_avail_bytes = ds4_engine_offload_avail_bytes(engine);
         char offerr[256] = "";
@@ -2350,6 +2381,12 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                     "ds4: expert-offload: worker %s:%d offers %.2f GiB for "
                     "experts\n", cfg.offload.host, offport,
+                    (double)worker_hello.mem_avail_bytes /
+                        (1024.0 * 1024.0 * 1024.0));
+            if (olog)
+                ds4_offload_logf(olog,
+                    "worker %s:%d offers %.2f GiB for experts",
+                    cfg.offload.host, offport,
                     (double)worker_hello.mem_avail_bytes /
                         (1024.0 * 1024.0 * 1024.0));
             ds4_offload_expert_ref *plan =
@@ -2369,12 +2406,21 @@ int main(int argc, char **argv) {
             decision.flags = ssd_tail ? DS4_OFFLOAD_HELLO_FLAG_SSD_TAIL : 0;
             uint32_t installed = 0;
             uint64_t wired = 0;
+            if (olog)
+                ds4_offload_logf(olog,
+                    "decision: coordinator RAM <- %u hottest, worker RAM <- "
+                    "next %u, SSD tail %u",
+                    coord_cap, worker_cap, ssd_tail);
             if (!plan ||
                 ds4_offload_client_orchestrate(offload_cli, &decision, plan,
                                                plan_n, &installed, &wired,
                                                offerr, sizeof(offerr)) != 0) {
                 fprintf(stderr, "ds4: expert-offload: orchestration failed (%s); "
                                 "running solo\n",
+                        plan ? offerr : "out of memory");
+                if (olog)
+                    ds4_offload_logf(olog,
+                        "orchestration failed (%s); running solo",
                         plan ? offerr : "out of memory");
                 ds4_offload_client_close(offload_cli);
                 offload_cli = NULL;
@@ -2384,12 +2430,21 @@ int main(int argc, char **argv) {
                         "(%.2f GiB wired); orchestration complete\n",
                         installed, plan_n,
                         (double)wired / (1024.0 * 1024.0 * 1024.0));
+                if (olog)
+                    ds4_offload_logf(olog,
+                        "worker installed %u/%u experts (%.2f GiB wired); "
+                        "orchestration complete",
+                        installed, plan_n,
+                        (double)wired / (1024.0 * 1024.0 * 1024.0));
                 ds4_engine_offload_bind(engine, offload_cli);
             }
             free(plan);
         } else {
             fprintf(stderr, "ds4: expert-offload: connect to %s:%d failed (%s); "
                             "running solo\n", cfg.offload.host, offport, offerr);
+            if (olog)
+                ds4_offload_logf(olog, "connect failed (%s); running solo",
+                                 offerr);
         }
     } else if (getenv("DS4_OFFLOAD_LOOPBACK")) {
         /* Single-process validation of the decode splice (no worker): the
@@ -2398,6 +2453,8 @@ int main(int argc, char **argv) {
          * under --ssd-streaming, H2). enable_loopback auto-sizes both tiers to
          * this machine's wired budget (no env vars needed), then we fill the
          * worker tier and decode to confirm parity with a solo run. */
+        ds4_engine_offload_set_log(
+            engine, cli_offload_log_open_once(cfg.offload.log_path));
         ds4_engine_offload_enable_loopback(engine);
         if (cli_offload_populate_cache(engine) != 0) {
             ds4_engine_close(engine);

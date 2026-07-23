@@ -258,6 +258,7 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--expert-offload HOST", "Coordinator: dial the worker at HOST, negotiate the expert split, and offload the worker's tier to it. Auto-enables the SSD-streaming regime for the cold tail.");
     opt(fp, c, "--expert-offload-bind IP", "Worker bind address (default: all interfaces).");
     opt(fp, c, "--expert-offload-port N", "TCP port for the offload link. Default: 47300");
+    opt(fp, c, "--expert-offload-log FILE", "Append a timestamped session log: per layer, which experts were served from local RAM / the worker (with wire latency) / SSD, plus per-token summaries and orchestration events. Works on both roles.");
     fputc('\n', fp);
 }
 

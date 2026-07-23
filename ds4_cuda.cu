@@ -27394,6 +27394,13 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
         g_stream_selected_cache.compact_count : 0;
 }
 
+extern "C" void ds4_gpu_stream_expert_cache_hitmiss(uint64_t *hits,
+                                                    uint64_t *misses) {
+    /* CUDA streaming path does not track these counters yet. */
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
+}
+
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 

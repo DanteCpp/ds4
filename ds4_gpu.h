@@ -148,6 +148,10 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+/* Cumulative streaming-cache lookups: hits = expert served from resident RAM,
+ * misses = expert had to be read from SSD. Delta over a layer's local compute
+ * attributes that layer's SSD reads (diagnostic; may include readahead noise). */
+void ds4_gpu_stream_expert_cache_hitmiss(uint64_t *hits, uint64_t *misses);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

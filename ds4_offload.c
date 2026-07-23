@@ -38,6 +38,59 @@ static double off_now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
+/* ------------------------------------------------------------------------
+ * Session debug log.
+ * --------------------------------------------------------------------- */
+
+struct ds4_offload_log {
+    FILE *f;
+    double t0_ms;
+};
+
+ds4_offload_log *ds4_offload_log_open(const char *path) {
+    if (!path || !path[0]) return NULL;
+    FILE *f = fopen(path, "a");
+    if (!f) {
+        fprintf(stderr, "ds4: offload log: cannot open %s: %s\n",
+                path, strerror(errno));
+        return NULL;
+    }
+    ds4_offload_log *l = calloc(1, sizeof(*l));
+    if (!l) { fclose(f); return NULL; }
+    l->f = f;
+    l->t0_ms = off_now_ms();
+    return l;
+}
+
+void ds4_offload_log_close(ds4_offload_log *l) {
+    if (!l) return;
+    fclose(l->f);
+    free(l);
+}
+
+static void off_logv(ds4_offload_log *l, int also_stderr,
+                     const char *fmt, va_list ap) {
+    if (!l || !l->f) return;
+    char body[1500];
+    vsnprintf(body, sizeof(body), fmt, ap);
+    fprintf(l->f, "ds4: [t=+%.1fms] %s\n", off_now_ms() - l->t0_ms, body);
+    fflush(l->f);
+    if (also_stderr)
+        fprintf(stderr, "ds4: [t=+%.1fms] %s\n", off_now_ms() - l->t0_ms, body);
+}
+
+void ds4_offload_logf(ds4_offload_log *l, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    off_logv(l, 1, fmt, ap);
+    va_end(ap);
+}
+
+void ds4_offload_logf_file(ds4_offload_log *l, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    off_logv(l, 0, fmt, ap);
+    va_end(ap);
+}
+
 /* Full read/write that survive short transfers and EINTR. Return 1 on success,
  * 0 on peer close or error. */
 static int off_write_full(int fd, const void *buf, size_t len) {
@@ -638,6 +691,30 @@ static void off_tok_agg_flush(off_tok_agg *a,
             a->layers > 0 ? a->compute_ms / a->layers : 0.0,
             wall_ms, a->errors, a->evict_hints,
             diag[0] ? " | " : "", diag);
+    if (opt->log) {
+        ds4_offload_logf(opt->log,
+            "tok#%llu done: %d layer-reqs, %d experts, compute %.2f ms "
+            "(%.2f ms/layer), wall %.2f ms, errors=%d, evict-hints=%d%s%s",
+            (unsigned long long)a->tok_no, a->layers, a->experts,
+            a->compute_ms,
+            a->layers > 0 ? a->compute_ms / a->layers : 0.0,
+            wall_ms, a->errors, a->evict_hints,
+            diag[0] ? " | " : "", diag);
+        /* The per-token expert map always goes to the session log (it is the
+         * point of the file); stderr gets it only in verbose mode. */
+        char map[1200];
+        size_t mo = (size_t)snprintf(map, sizeof(map), "tok#%llu experts:",
+                                     (unsigned long long)a->tok_no);
+        for (int l = 0; l < DS4_OFFLOAD_N_LAYER && mo < sizeof(map) - 40; l++) {
+            if (!a->k[l]) continue;
+            mo += (size_t)snprintf(map + mo, sizeof(map) - mo, " L%d=[", l);
+            for (int i = 0; i < a->k[l]; i++)
+                mo += (size_t)snprintf(map + mo, sizeof(map) - mo, "%s%u",
+                                       i ? "," : "", (unsigned)a->ids[l][i]);
+            mo += (size_t)snprintf(map + mo, sizeof(map) - mo, "]");
+        }
+        ds4_offload_logf_file(opt->log, "%s", map);
+    }
     if (off_worker_verbose()) {
         fprintf(stderr, "ds4-offload:   tok#%llu experts:",
                 (unsigned long long)a->tok_no);
@@ -716,6 +793,13 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                 decision.worker_cap, decision.coord_cap,
                 (decision.flags & DS4_OFFLOAD_HELLO_FLAG_SSD_TAIL)
                     ? "active on coordinator" : "empty (combined RAM fits all)");
+        if (opt->log)
+            ds4_offload_logf(opt->log,
+                "coordinator connected; plan: %u experts for this worker "
+                "(coordinator keeps %u hottest, SSD tail %s)",
+                decision.worker_cap, decision.coord_cap,
+                (decision.flags & DS4_OFFLOAD_HELLO_FLAG_SSD_TAIL)
+                    ? "active on coordinator" : "empty (combined RAM fits all)");
         if (decision.plan_count != decision.worker_cap ||
             decision.plan_count > DS4_OFFLOAD_PLAN_MAX) {
             fprintf(stderr, "ds4-offload: bad plan_count %u (worker_cap %u), "
@@ -771,6 +855,11 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
             fprintf(stderr,
                     "ds4-offload: plan installed: %u/%u experts wired "
                     "(%.2f GiB); serving\n",
+                    installed, count,
+                    (double)wired / (1024.0 * 1024.0 * 1024.0));
+            if (opt->log)
+                ds4_offload_logf(opt->log,
+                    "plan installed: %u/%u experts wired (%.2f GiB); serving",
                     installed, count,
                     (double)wired / (1024.0 * 1024.0 * 1024.0));
         }
@@ -833,16 +922,25 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                         "replying ERROR\n", layer, k);
             }
 
-            if (off_worker_verbose()) {
-                fprintf(stderr,
-                        "ds4-offload:   req seq=%llu L%d k=%d ids=[",
-                        (unsigned long long)seq, layer, k);
-                for (int i = 0; i < k; i++)
-                    fprintf(stderr, "%s%u", i ? "," : "", (unsigned)ids[i]);
-                fprintf(stderr, "] w=[");
-                for (int i = 0; i < k; i++)
-                    fprintf(stderr, "%s%.4f", i ? "," : "", (double)weights[i]);
-                fprintf(stderr, "] compute=%.2f ms %s\n",
+            if (off_worker_verbose() || opt->log) {
+                char ids_buf[64], w_buf[96];
+                size_t io = 0, wo = 0;
+                for (int i = 0; i < k; i++) {
+                    io += (size_t)snprintf(ids_buf + io, sizeof(ids_buf) - io,
+                                           "%s%u", i ? "," : "", (unsigned)ids[i]);
+                    wo += (size_t)snprintf(w_buf + wo, sizeof(w_buf) - wo,
+                                           "%s%.4f", i ? "," : "", (double)weights[i]);
+                }
+                if (off_worker_verbose())
+                    fprintf(stderr,
+                            "ds4-offload:   req seq=%llu L%d k=%d ids=[%s] "
+                            "w=[%s] compute=%.2f ms %s\n",
+                            (unsigned long long)seq, layer, k, ids_buf, w_buf,
+                            compute_ms, compute_rc == 0 ? "ok" : "ERROR");
+                if (opt->log)
+                    ds4_offload_logf_file(opt->log,
+                        "req seq=%llu L%d k=%d ids=[%s] w=[%s] compute=%.2f ms %s",
+                        (unsigned long long)seq, layer, k, ids_buf, w_buf,
                         compute_ms, compute_rc == 0 ? "ok" : "ERROR");
             }
 
@@ -893,6 +991,13 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                 agg.tok_no > 0
                     ? " (see per-token lines above for per-layer detail)"
                     : "");
+        if (opt->log)
+            ds4_offload_logf(opt->log,
+                "session totals: %llu tokens, %llu layer-reqs, %llu experts, "
+                "compute %.2f ms total; coordinator disconnected",
+                (unsigned long long)agg.tok_no,
+                (unsigned long long)sess_reqs,
+                (unsigned long long)sess_experts, sess_compute_ms);
 
         free(reqbuf); free(respbuf); free(hidden); free(out);
         close(cfd);
