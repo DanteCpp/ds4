@@ -234,8 +234,23 @@ int ds4_gpu_offload_cache_install_expert(int layer, int expert,
                                          uint64_t gate_expert_bytes,
                                          uint64_t down_expert_bytes,
                                          char *err, size_t errlen);
+/* Phase-2 dynamic swap (plan §6): make (layer, expert) resident, evicting the
+ * cache's LRU-coldest expert into its slot (pread from the local GGUF). Called
+ * only from the single worker loop thread, after a response is sent (off the
+ * critical path). Idempotent. Returns 0 on success, -1 on error (message in
+ * err); on error the coordinator self-heals via ERROR-reply -> local fallback. */
+int ds4_gpu_offload_cache_replace_expert(int layer, int expert,
+                                         uint64_t gate_abs_offset,
+                                         uint64_t up_abs_offset,
+                                         uint64_t down_abs_offset,
+                                         uint64_t gate_expert_bytes,
+                                         uint64_t down_expert_bytes,
+                                         char *err, size_t errlen);
 void ds4_gpu_offload_cache_stats(uint32_t *resident, uint32_t *budget,
                                  uint32_t *slab_count, uint64_t *bytes_allocated);
+/* Phase-2 swap telemetry: cumulative offload-cache hits, misses, and swaps. */
+void ds4_gpu_offload_cache_swap_stats(uint64_t *hits, uint64_t *misses,
+                                      uint64_t *swaps);
 /* Total slab bytes that failed to mlock (0 = fully wired). Non-zero means part
  * of the cache is pageable — the OS may swap experts onto the critical path. */
 uint64_t ds4_gpu_offload_cache_mlock_failed_bytes(void);

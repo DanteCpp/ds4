@@ -636,6 +636,8 @@ static bool     g_offload_expert_cache_active;
 static uint64_t g_offload_expert_cache_hits;
 static uint64_t g_offload_expert_cache_misses;
 static uint64_t g_offload_expert_cache_mlock_fail_bytes; /* M2: unlocked slab bytes */
+static uint64_t g_offload_expert_cache_clock;            /* LRU recency clock     */
+static uint64_t g_offload_expert_cache_swaps;            /* Phase-2 dynamic swaps */
 static uint64_t g_stream_expert_cache_layer_hits[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_misses[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_evictions[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -11738,6 +11740,8 @@ void ds4_gpu_offload_cache_reset(void) {
     g_offload_expert_cache_hits = 0;
     g_offload_expert_cache_misses = 0;
     g_offload_expert_cache_mlock_fail_bytes = 0;
+    g_offload_expert_cache_clock = 0;
+    g_offload_expert_cache_swaps = 0;
 }
 
 /* M2: total slab bytes that failed to mlock (0 = fully wired). A non-zero value
@@ -11860,10 +11864,125 @@ int ds4_gpu_offload_cache_install_expert(int layer, int expert,
     e->up_inner = (NSUInteger)up_inner;
     e->down_inner = (NSUInteger)down_inner;
     e->slab_slot = g_offload_expert_cache_resident;
-    e->last_used = 0;
+    e->last_used = ++g_offload_expert_cache_clock;
     e->valid = 1;
     g_offload_expert_cache_resident++;
     return 0;
+}
+
+/* Phase-2 dynamic swap (plan §6): make (layer, expert) resident, evicting this
+ * cache's LRU-coldest expert to reuse its mlock'd slot. Called by the worker's
+ * evict hook AFTER the response is sent (off the critical path) and only from
+ * the single worker loop thread, so no GPU command is reading the reused slot
+ * concurrently — no lock needed. Idempotent: a already-resident expert is just
+ * touched. Returns 0 on success, -1 on error (the caller logs and continues;
+ * the coordinator's residency belief self-heals since a subsequent miss on this
+ * node replies ERROR -> coordinator local fallback). */
+int ds4_gpu_offload_cache_replace_expert(int layer, int expert,
+                                         uint64_t gate_abs_offset,
+                                         uint64_t up_abs_offset,
+                                         uint64_t down_abs_offset,
+                                         uint64_t gate_expert_bytes,
+                                         uint64_t down_expert_bytes,
+                                         char *err, size_t errlen) {
+    if (!g_offload_expert_cache_active) {
+        if (err) snprintf(err, errlen, "offload cache: not configured");
+        return -1;
+    }
+    if (layer < 0 || layer >= DS4_OFFLOAD_N_LAYER ||
+        expert < 0 || expert >= DS4_OFFLOAD_N_ROUTED) {
+        if (err) snprintf(err, errlen, "offload cache: layer/expert out of range");
+        return -1;
+    }
+    ds4_gpu_offload_expert_entry *tgt = &g_offload_expert_cache[layer][expert];
+    if (tgt->valid) {                       /* already here: promote in LRU */
+        tgt->last_used = ++g_offload_expert_cache_clock;
+        return 0;
+    }
+    /* If the budget is not yet full (warm-up), a plain install is cheaper than
+     * an eviction and keeps occupancy climbing to the negotiated capacity. */
+    if (g_offload_expert_cache_resident < g_offload_expert_cache_budget) {
+        return ds4_gpu_offload_cache_install_expert(
+                layer, expert, gate_abs_offset, up_abs_offset, down_abs_offset,
+                gate_expert_bytes, down_expert_bytes, err, errlen);
+    }
+
+    /* Find the LRU-coldest resident expert to evict; reuse its slot. */
+    ds4_gpu_offload_expert_entry *victim = NULL;
+    uint64_t oldest = UINT64_MAX;
+    for (int l = 0; l < DS4_OFFLOAD_N_LAYER; l++) {
+        for (int x = 0; x < DS4_OFFLOAD_N_ROUTED; x++) {
+            ds4_gpu_offload_expert_entry *e = &g_offload_expert_cache[l][x];
+            if (e->valid && e->last_used < oldest) { oldest = e->last_used; victim = e; }
+        }
+    }
+    if (!victim) {
+        if (err) snprintf(err, errlen, "offload cache: no victim to evict");
+        return -1;
+    }
+
+    /* Validate the incoming expert's byte geometry matches the slot layout
+     * before we overwrite the victim (so a bad request cannot corrupt a good
+     * slot). */
+    uint64_t want = gate_expert_bytes * 2ull + down_expert_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (page != 0) want = round_up_u64(want, page);
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        want != g_offload_expert_cache_slab_slot_bytes) {
+        if (err) snprintf(err, errlen, "offload cache: expert size mismatch on swap");
+        return -1;
+    }
+
+    id<MTLBuffer> slab = victim->gate_buffer;      /* gate/up/down share the slab */
+    uint8_t *contents = slab ? (uint8_t *)slab.contents : NULL;
+    if (!contents) {
+        if (err) snprintf(err, errlen, "offload cache: victim slot has no contents");
+        return -1;
+    }
+    const NSUInteger gate_inner = victim->gate_inner;
+    const NSUInteger up_inner   = victim->up_inner;
+    const NSUInteger down_inner = victim->down_inner;
+    const uint32_t   slab_slot  = victim->slab_slot;
+
+    uint64_t rb = 0; double ms = 0.0;
+    if (!ds4_gpu_stream_expert_pread_into(gate_abs_offset, gate_expert_bytes,
+                                          contents + gate_inner, &rb, &ms) ||
+        !ds4_gpu_stream_expert_pread_into(up_abs_offset, gate_expert_bytes,
+                                          contents + up_inner, &rb, &ms) ||
+        !ds4_gpu_stream_expert_pread_into(down_abs_offset, down_expert_bytes,
+                                          contents + down_inner, &rb, &ms)) {
+        /* pread failed: the victim slot is now partially overwritten and no
+         * longer holds a valid expert. Invalidate it (its next request replies
+         * ERROR -> coordinator local fallback) rather than serve garbage. */
+        victim->valid = 0;
+        g_offload_expert_cache_resident--;
+        if (err) snprintf(err, errlen,
+                          "offload cache: pread failed swapping in L%d E%d",
+                          layer, expert);
+        return -1;
+    }
+
+    victim->valid = 0;                              /* vacate the victim entry   */
+    tgt->gate_buffer = slab;
+    tgt->up_buffer   = slab;
+    tgt->down_buffer = slab;
+    tgt->gate_inner  = gate_inner;
+    tgt->up_inner    = up_inner;
+    tgt->down_inner  = down_inner;
+    tgt->slab_slot   = slab_slot;
+    tgt->last_used   = ++g_offload_expert_cache_clock;
+    tgt->valid       = 1;
+    g_offload_expert_cache_swaps++;
+    return 0;
+}
+
+/* Phase-2 swap telemetry: hits/misses on the offload cache and the number of
+ * dynamic LRU swaps performed since startup. */
+void ds4_gpu_offload_cache_swap_stats(uint64_t *hits, uint64_t *misses,
+                                      uint64_t *swaps) {
+    if (hits) *hits = g_offload_expert_cache_hits;
+    if (misses) *misses = g_offload_expert_cache_misses;
+    if (swaps) *swaps = g_offload_expert_cache_swaps;
 }
 
 void ds4_gpu_offload_cache_stats(uint32_t *resident, uint32_t *budget,
@@ -27907,7 +28026,7 @@ int ds4_gpu_offload_cache_run_layer(uint32_t gate_type, uint32_t down_type,
         up_bufs[i]   = e->up_buffer;   up_offs[i]   = e->up_inner;
         down_bufs[i] = e->down_buffer; down_offs[i] = e->down_inner;
         wpad[i] = (int)i < k ? weights[i] : 0.0f;
-        e->last_used++;
+        e->last_used = ++g_offload_expert_cache_clock;
         g_offload_expert_cache_hits++;
     }
 

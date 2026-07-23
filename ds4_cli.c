@@ -145,6 +145,24 @@ static void cli_offload_diag(void *user, char *buf, size_t buflen) {
     ds4_engine_offload_cache_diag((ds4_engine *)user, buf, buflen);
 }
 
+/* Phase-2 dynamic swap (plan §6): the coordinator piggybacked demoted experts
+ * as evict hints; page each into this worker's mlock'd cache (evicting the
+ * cache's LRU-coldest to reuse its slot). Runs AFTER the response is sent, so
+ * off the critical path. A failure is non-fatal: the coordinator self-heals
+ * because a later miss on this expert replies ERROR -> coordinator local
+ * fallback (H1). */
+static void cli_offload_evict(void *user, int layer,
+                              const uint16_t *evict_ids, int evict_k) {
+    ds4_engine *engine = (ds4_engine *)user;
+    for (int i = 0; i < evict_k; i++) {
+        char err[160] = "";
+        if (ds4_engine_offload_cache_replace(engine, layer, (int)evict_ids[i],
+                                             err, sizeof(err)) != 0)
+            fprintf(stderr, "ds4: expert-server: swap-in L%d E%u failed: %s\n",
+                    layer, evict_ids[i], err);
+    }
+}
+
 /* Orchestration (v2): the coordinator's PLAN arrived — install exactly those
  * experts into this worker's mlock'd cache. */
 static int cli_offload_plan(void *user, uint32_t coord_cap,
@@ -233,7 +251,7 @@ static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
             "waiting for the coordinator's plan\n",
             (double)opt.hello.mem_avail_bytes / (1024.0 * 1024.0 * 1024.0));
     opt.compute = cli_offload_compute;
-    opt.evict = NULL;                 /* Phase-2 dynamic swaps: not yet */
+    opt.evict = cli_offload_evict;    /* Phase-2 dynamic LRU swaps (plan §6) */
     opt.plan = cli_offload_plan;
     opt.diag = cli_offload_diag;
     opt.log = cli_offload_log_open_once(cfg->offload.log_path);
