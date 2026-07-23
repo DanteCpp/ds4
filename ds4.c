@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <mach/mach.h>
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -35636,10 +35637,38 @@ static uint32_t offload_env_experts(const char *name) {
     return (uint32_t)n;
 }
 
+/* Memory that is actually allocatable right now: free pages plus the
+ * reclaimable ones (inactive, purgeable, speculative). The wired-limit
+ * sysctl says how much we MAY lock — it knows nothing about what other
+ * processes (or our own engine) already hold, so trusting it alone OOMs the
+ * machine (mtwo crash). 0 when unknown (non-Apple): callers skip the clamp. */
+static uint64_t offload_host_available_bytes(void) {
+#if defined(__APPLE__)
+    vm_statistics64_data_t st;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&st, &count) != KERN_SUCCESS)
+        return 0;
+    const uint64_t pages = (uint64_t)st.free_count + st.inactive_count +
+                           st.purgeable_count + st.speculative_count;
+    return pages * (uint64_t)vm_page_size;
+#else
+    return 0;
+#endif
+}
+
+/* Hard OOM-safety cap: never commit more than 90% of what is available at
+ * this moment. UINT64_MAX when availability is unknown (non-Apple). */
+static uint64_t offload_safe_budget_bytes(void) {
+    const uint64_t avail = offload_host_available_bytes();
+    return avail > 0 ? avail - avail / 10ull : UINT64_MAX;
+}
+
 /* Bytes this machine can wire for the offload expert cache: the GPU wired
  * limit (or, when iogpu.wired_limit_mb was not raised, macOS's default wired
  * ceiling of ~2/3 of physical RAM) minus a fixed reserve for the OS, the
- * mmap'd backbone working set, and transient staging. */
+ * mmap'd backbone working set, and transient staging — further clamped to
+ * 90% of the memory that is actually available right now. */
 static uint64_t offload_avail_bytes(void) {
     const uint64_t reserve = 6ull * 1024 * 1024 * 1024;
     uint64_t wired = glm_graph_wired_limit_bytes();
@@ -35647,7 +35676,26 @@ static uint64_t offload_avail_bytes(void) {
         const uint64_t ram = glm_graph_host_memory_bytes();
         wired = ram - ram / 3ull;
     }
-    return wired > reserve ? wired - reserve : 0;
+    uint64_t budget = wired > reserve ? wired - reserve : 0;
+    const uint64_t avail = offload_host_available_bytes();
+    const uint64_t safe = offload_safe_budget_bytes();
+    const int clamped = budget > safe;
+    if (clamped) budget = safe;
+    static int logged;
+    if (!logged && avail > 0) {
+        const uint64_t ram = glm_graph_host_memory_bytes();
+        fprintf(stderr,
+                "ds4: offload memory check: %.2f GiB available of %.2f GiB "
+                "physical (%.2f GiB in use); expert-cache budget %.2f GiB "
+                "(90%% safety cap%s)\n",
+                (double)avail / (1024.0 * 1024.0 * 1024.0),
+                (double)ram / (1024.0 * 1024.0 * 1024.0),
+                (double)(ram > avail ? ram - avail : 0) / (1024.0 * 1024.0 * 1024.0),
+                (double)budget / (1024.0 * 1024.0 * 1024.0),
+                clamped ? ", wired-limit budget was too big" : "");
+        logged = 1;
+    }
+    return budget;
 }
 
 uint64_t ds4_engine_offload_avail_bytes(ds4_engine *e) {
@@ -56927,9 +56975,13 @@ static int offload_cache_install_list(ds4_engine *e,
         return -1;
     }
 
-    /* M1: report the planned wired footprint and warn if it crowds physical RAM.
-     * The offload cache is mlock'd, so unlike the mmap backbone it cannot be
-     * reclaimed under pressure — overcommitting drives compressor thrash. */
+    /* M1: report the planned wired footprint, then the hard OOM-safety gate:
+     * re-check what is actually available at install time (the plan may have
+     * been decided minutes ago, and memory moves). Wiring more than 90% of
+     * what is free right now risks killing the machine — the mlock'd cache
+     * cannot be reclaimed under pressure, unlike the mmap backbone. Refuse
+     * instead: the worker rejects the plan and the coordinator runs solo
+     * (correct degrade), which beats an OOM crash. */
     const uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
     const uint64_t planned_bytes = (uint64_t)budget * slot_bytes;
     const uint64_t phys_ram = glm_graph_host_memory_bytes();
@@ -56937,6 +56989,17 @@ static int offload_cache_install_list(ds4_engine *e,
             "ds4: offload cache plan: %u experts x %.2f MiB = %.2f GiB mlock'd\n",
             budget, (double)slot_bytes / (1024.0 * 1024.0),
             (double)planned_bytes / (1024.0 * 1024.0 * 1024.0));
+    const uint64_t avail_now = offload_host_available_bytes();
+    const uint64_t safe_now = offload_safe_budget_bytes();
+    if (planned_bytes > safe_now) {
+        if (err) snprintf(err, errlen,
+                "refusing to wire %.2f GiB: only %.2f GiB currently available "
+                "(90%% safety cap %.2f GiB)",
+                (double)planned_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double)avail_now / (1024.0 * 1024.0 * 1024.0),
+                (double)safe_now / (1024.0 * 1024.0 * 1024.0));
+        return -1;
+    }
     if (phys_ram > 0 && planned_bytes > phys_ram - phys_ram / 10ull) {
         fprintf(stderr,
                 "ds4: WARNING: offload cache (%.2f GiB) exceeds 90%% of physical "
