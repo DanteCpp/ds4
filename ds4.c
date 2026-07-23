@@ -21846,6 +21846,33 @@ static int metal_graph_routed_moe_or_offload(
                                    local_idx, n_local, remote_idx, n_remote,
                                    swap_evict, swap_load);
 
+    /* Commit any planned swap NOW — even when this layer has no remote
+     * experts.  An SSD-read expert is hot by definition and must become
+     * coordinator-resident immediately so the next access hits RAM, not
+     * SSD.  When there is no EXPERT_REQ to piggyback on we send a k=0
+     * request that delivers the swap hints to the worker without asking
+     * for any computation; the worker applies the swap and replies OK
+     * with a zero vector, which we discard. */
+    if (swap_k > 0) {
+        offload_commit_swaps(e, (int)layer_index, swap_evict, swap_load, swap_k);
+        if (n_remote == 0) {
+            /* Deliver the swap to the worker via a k=0 piggyback request. */
+            uint16_t dummy16[DS4_OFFLOAD_N_EMBD];
+            float dummyf = 0.0f;
+            memset(dummy16, 0, sizeof(dummy16));
+            char err[160] = "";
+            uint64_t seq = ds4_offload_client_request(
+                    ds4_engine_offload_client(e), (int)layer_index,
+                    &dummy16[0], &dummyf, 0, dummy16,
+                    swap_evict, swap_load, swap_k, err, sizeof(err));
+            if (seq) {
+                uint16_t unused[DS4_OFFLOAD_N_EMBD];
+                (void)ds4_offload_client_collect(
+                        ds4_engine_offload_client(e), seq, unused, err, sizeof(err));
+            }
+        }
+    }
+
     if (n_remote == 0) {          /* all experts resident: plain local compute */
         if (ds4_gpu_begin_commands() == 0) return 0;
         const int rc = OFFLOAD_PASSTHROUGH();
@@ -57104,8 +57131,13 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
                                        const uint16_t *hidden_f16,
                                        uint16_t *out_f16) {
     if (!e || layer < 0 || layer >= ds4_engine_layer_count(e) ||
-        k <= 0 || (uint32_t)k > (uint32_t)DS4_N_EXPERT_USED) {
+        k < 0 || (uint32_t)k > (uint32_t)DS4_N_EXPERT_USED) {
         return -1;
+    }
+    /* k == 0: swap-only piggyback — no experts to compute, return zero. */
+    if (k == 0) {
+        memset(out_f16, 0, DS4_OFFLOAD_HIDDEN_F16_BYTES);
+        return 0;
     }
     const ds4_layer_weights *l = &e->weights.layer[layer];
     if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return -1;
