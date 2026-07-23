@@ -21598,27 +21598,35 @@ static int offload_fetch_remote_partial(ds4_engine *e, int layer,
     return rc;
 }
 
-/* Plan one coordinator-authoritative cache swap for a fired layer (plan §6).
- * First touch the recency of every selected expert. Then, to convert a recurring
- * SSD read into an offload: find a selected LOCAL expert Z that is being read
- * from SSD right now (not resident in the streaming RAM cache) and has been seen
- * before, and move it onto the worker — evicting the worker's LRU-coldest expert
- * of this layer that is not selected now. The coordinator names BOTH sides of
- * the swap (evict E, load Z) and mirrors the identical change in its residency
- * bitmap, so its belief and the worker cache stay perfectly in sync. At most one
- * swap per layer bounds churn. Returns the number of swaps written (0 or 1);
- * fills swap_evict[0]/swap_load[0] when 1. */
+/* Plan one coordinator-authoritative cache swap for a fired layer, implementing
+ * the 3-level LRU promotion policy (L1 = coordinator RAM, L2 = worker, L3 = SSD).
+ * A routed expert is promoted toward L1; the coordinator's L1-coldest expert Y is
+ * demoted to the worker (L2), which in turn drops its coldest to SSD. Two cases,
+ * both a single coordinator-named (evict, load) worker swap that offload_commit_
+ * swaps() mirrors (evict target -> local, load target -> worker), keeping the two
+ * caches in lock-step:
+ *
+ *   Case B (#3/#5): a recurring expert now on the WORKER is routed -> promote it
+ *     to L1. It leaves the worker (evict it) and Y takes its slot (load Y).
+ *   Case C (#4/#6): a recurring expert on SSD is routed (the streaming cache
+ *     promotes it to L1 locally) -> demote Y to the worker, evicting the worker's
+ *     coldest W (load Y into W's slot).
+ *
+ * In both, Y = the coordinator RAM cache's LRU-coldest expert of this layer (a
+ * streaming-resident local expert), and the promoted expert ends up local. At
+ * most one swap per layer bounds churn. Returns 1 and fills swap_evict[0]/
+ * swap_load[0] when a swap is planned, else 0. */
 static int offload_plan_swap(ds4_engine *e, int layer,
                              const uint16_t *sel_ids, int k,
                              const uint8_t *local_idx, int n_local,
-                             int can_swap,
+                             const uint8_t *remote_idx, int n_remote,
                              uint16_t *swap_evict, uint16_t *swap_load) {
     if (!g_offload_swap_checked) {
         g_offload_swap_disabled = getenv("DS4_OFFLOAD_NO_SWAP") != NULL;
         g_offload_swap_checked = true;
     }
-    /* Bump recency for every selected expert first, so the victim search below
-     * never targets an expert in active use this layer. */
+    /* Bump recency for every selected expert first, so the victim searches below
+     * never target an expert in active use this layer. */
     const uint64_t tick = ++g_offload_swap_clock;
     uint64_t prev_lu[DS4_OFFLOAD_N_USED];
     for (int i = 0; i < k; i++) {
@@ -21630,49 +21638,62 @@ static int offload_plan_swap(ds4_engine *e, int layer,
             prev_lu[i] = tick;
         }
     }
-    /* Swaps ride on an EXPERT_REQ, so only plan one when this layer already
-     * fires a worker request (can_swap); all-local layers still update recency
-     * above but defer any swap to a layer that has wire traffic. */
-    if (g_offload_swap_disabled || !can_swap) return 0;
+    /* Swaps ride on this layer's EXPERT_REQ, so only plan when it fires one
+     * (n_remote > 0); all-local layers still update recency above. */
+    if (g_offload_swap_disabled || n_remote == 0) return 0;
 
-    /* Load candidate Z: a selected LOCAL expert, seen before (recurring, not a
-     * one-off), that is NOT resident in the streaming RAM cache — i.e. this
-     * layer just paid (or is about to pay) an SSD read for it. Moving Z to the
-     * worker makes its next hit an ~2 ms offload instead of an SSD read. */
-    int load_z = -1;
-    for (int i = 0; i < n_local; i++) {
-        const int pos = (int)local_idx[i];
-        if (pos < 0 || pos >= k) continue;
-        const int z = (int)sel_ids[pos];
-        if (z < 0 || z >= DS4_OFFLOAD_N_ROUTED) continue;
-        if (prev_lu[pos] == 0) continue;                 /* first sighting: skip */
-        if (ds4_gpu_stream_expert_cache_contains(layer, z)) continue; /* in RAM  */
-        load_z = z; break;
-    }
-    if (load_z < 0) return 0;
-
-    /* Evict target E: the LRU-coldest WORKER expert (residency == remote) of this
-     * layer that is not selected now. The full ds4_engine struct is defined later
-     * in this file, so reach the bitmap through the accessor (same object). */
+    /* Y = the coordinator RAM cache's LRU-coldest expert of this layer: a local
+     * (resident) expert that is actually in the streaming RAM cache and not in
+     * use now. This is "the cold expert evicted from the coordinator" that gets
+     * demoted to the worker. The full ds4_engine struct is defined later in this
+     * file, so reach the bitmap through the accessor (same object). */
     ds4_offload_residency *res =
         (ds4_offload_residency *)ds4_engine_offload_residency(e);
     if (!res) return 0;
-    int evict_e = -1; uint64_t oldest = UINT64_MAX;
+    int demote_y = -1; uint64_t oldest_y = UINT64_MAX;
     for (int x = 0; x < DS4_OFFLOAD_N_ROUTED; x++) {
-        if (ds4_offload_residency_get(res, layer, x)) continue;   /* local, not on worker */
+        if (!ds4_offload_residency_get(res, layer, x)) continue;      /* on worker */
+        if (!ds4_gpu_stream_expert_cache_contains(layer, x)) continue;/* SSD-tier  */
         bool selected = false;
         for (int i = 0; i < k; i++) if ((int)sel_ids[i] == x) { selected = true; break; }
-        if (selected) continue;                    /* in use this layer: keep it */
-        if (g_offload_lu[layer][x] < oldest) { oldest = g_offload_lu[layer][x]; evict_e = x; }
+        if (selected) continue;
+        if (g_offload_lu[layer][x] < oldest_y) { oldest_y = g_offload_lu[layer][x]; demote_y = x; }
     }
-    if (evict_e < 0) return 0;                      /* no spare worker slot in layer */
+    if (demote_y < 0) return 0;   /* nothing cold enough in L1 to demote */
 
-    /* Decide the swap but DO NOT mirror residency yet: the coordinator must only
-     * update its belief once it knows the worker received the frame (a failed
-     * send would otherwise leave the two permanently out of sync). The commit
-     * happens in offload_commit_swaps() after a successful send. */
-    swap_evict[0] = (uint16_t)evict_e;
-    swap_load[0]  = (uint16_t)load_z;
+    /* Case B: a recurring worker (remote) expert is routed -> promote it to L1.
+     * Evict it from the worker (it's now served locally) and load Y into its slot. */
+    for (int i = 0; i < n_remote; i++) {
+        const int pos = (int)remote_idx[i];
+        if (pos < 0 || pos >= k) continue;
+        if (prev_lu[pos] == 0) continue;               /* one-off: not worth an SSD promote */
+        swap_evict[0] = sel_ids[pos];                  /* promoted expert leaves worker */
+        swap_load[0]  = (uint16_t)demote_y;            /* Y takes its slot              */
+        return 1;
+    }
+
+    /* Case C: a recurring SSD-tier expert is routed (streaming cache promotes it
+     * to L1 locally). Demote Y to the worker, evicting the worker's LRU-coldest
+     * W of this layer to SSD. */
+    bool ssd_promote = false;
+    for (int i = 0; i < n_local; i++) {
+        const int pos = (int)local_idx[i];
+        if (pos < 0 || pos >= k) continue;
+        if (prev_lu[pos] == 0) continue;
+        if (!ds4_gpu_stream_expert_cache_contains(layer, (int)sel_ids[pos])) { ssd_promote = true; break; }
+    }
+    if (!ssd_promote) return 0;
+    int evict_w = -1; uint64_t oldest_w = UINT64_MAX;
+    for (int x = 0; x < DS4_OFFLOAD_N_ROUTED; x++) {
+        if (ds4_offload_residency_get(res, layer, x)) continue;      /* local, want worker */
+        bool selected = false;
+        for (int i = 0; i < k; i++) if ((int)sel_ids[i] == x) { selected = true; break; }
+        if (selected) continue;
+        if (g_offload_lu[layer][x] < oldest_w) { oldest_w = g_offload_lu[layer][x]; evict_w = x; }
+    }
+    if (evict_w < 0) return 0;
+    swap_evict[0] = (uint16_t)evict_w;                 /* worker's coldest -> SSD */
+    swap_load[0]  = (uint16_t)demote_y;                /* Y -> worker            */
     return 1;
 }
 
@@ -21825,12 +21846,13 @@ static int metal_graph_routed_moe_or_offload(
                                 remote_idx, &n_remote);
 
     /* Phase-2: touch recency and, when this layer fires a worker request, plan
-     * at most one coordinator-authoritative swap (evict E from the worker, load
-     * an SSD-missing local expert Z onto it). The residency change takes effect
-     * next token; this token still uses the split just computed. */
+     * at most one coordinator-authoritative 3-level LRU swap — promote a routed
+     * non-L1 expert toward the coordinator cache and demote the coordinator's
+     * L1-coldest expert to the worker. The residency change takes effect next
+     * token; this token still uses the split just computed. */
     uint16_t swap_evict[DS4_OFFLOAD_N_USED], swap_load[DS4_OFFLOAD_N_USED];
     int swap_k = offload_plan_swap(e, (int)layer_index, ids16, (int)n_expert,
-                                   local_idx, n_local, n_remote > 0,
+                                   local_idx, n_local, remote_idx, n_remote,
                                    swap_evict, swap_load);
 
     if (n_remote == 0) {          /* all experts resident: plain local compute */
