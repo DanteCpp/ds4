@@ -21509,6 +21509,14 @@ static uint64_t g_offload_coord_swaps;                /* swaps issued (telemetry
 static bool     g_offload_swap_disabled;              /* DS4_OFFLOAD_NO_SWAP     */
 static bool     g_offload_swap_checked;
 
+/* Per-layer pending swap (deferred from a layer that had n_remote==0).
+ * Committed locally, piggybacked on the next EXPERT_REQ for this layer. */
+static struct {
+    bool     pending;
+    uint16_t evict;
+    uint16_t load;
+} g_offload_pending_swap[DS4_OFFLOAD_N_LAYER];
+
 /* Global rank of (layer, expert): index in the flash hotlist for ranked experts,
  * then the hotlist-absent (coldest) experts appended in a deterministic
  * (layer, expert) order so EVERY expert gets a distinct rank in [0, 11008). Both
@@ -21543,6 +21551,16 @@ static bool offload_expert_is_remote(int layer, int expert) {
     const long lo = (long)g_offload_coord_cap;
     const long hi = lo + (long)g_offload_worker_cap;
     return (long)r >= lo && (long)r < hi;
+}
+
+/* True if this expert is in the coldest SSD-only tail (no coordinator
+ * cache slot, no worker slot).  Used to filter the ssd log counter so
+ * swap-churn reads (a demoted worker expert re-read from SSD) are not
+ * counted as genuine last-resort SSD servings. */
+bool ds4_engine_offload_expert_in_ssd_tail(int layer, int expert) {
+    const int r = offload_hotlist_rank(layer, expert);
+    const long tail_start = (long)g_offload_coord_cap + (long)g_offload_worker_cap;
+    return (long)r >= tail_start;
 }
 
 /* f32 -> f16 and f16 -> f32 for the 8 KB wire hidden/partial (matches §8). */
@@ -21808,11 +21826,15 @@ static int metal_graph_routed_moe_or_offload(
         return OFFLOAD_PASSTHROUGH();
     }
 
-    /* Session log: snapshot the streaming-cache counters; the miss delta over
-     * the local compute below attributes this layer's SSD reads. */
+    /* Session log: snapshot the streaming-cache counters; the tail-miss
+     * delta over the local compute below counts only genuine SSD-tail
+     * reads (experts that live on neither coordinator cache nor worker). */
     ds4_offload_log *olog = ds4_engine_offload_log(e);
-    uint64_t slog_m0 = 0, slog_h0 = 0;
-    if (olog) ds4_gpu_stream_expert_cache_hitmiss(&slog_h0, &slog_m0);
+    uint64_t slog_m0 = 0, slog_h0 = 0, slog_t0 = 0;
+    if (olog) {
+        ds4_gpu_stream_expert_cache_hitmiss(&slog_h0, &slog_m0);
+        slog_t0 = ds4_gpu_stream_expert_cache_tail_misses();
+    }
 
     /* Commit pending work so the router selection + normalized hidden are
      * host-readable (same sync the CPU-router path performs). */
@@ -21849,27 +21871,18 @@ static int metal_graph_routed_moe_or_offload(
     /* Commit any planned swap NOW — even when this layer has no remote
      * experts.  An SSD-read expert is hot by definition and must become
      * coordinator-resident immediately so the next access hits RAM, not
-     * SSD.  When there is no EXPERT_REQ to piggyback on we send a k=0
-     * request that delivers the swap hints to the worker without asking
-     * for any computation; the worker applies the swap and replies OK
-     * with a zero vector, which we discard. */
+     * SSD.  The residency update is local; the worker is told later when a
+     * real EXPERT_REQ next fires for this same layer, piggybacking the
+     * deferred swap.  During the gap a demoted Y that gets requested will
+     * cause an ERROR -> local-fallback (rare). */
     if (swap_k > 0) {
         offload_commit_swaps(e, (int)layer_index, swap_evict, swap_load, swap_k);
         if (n_remote == 0) {
-            /* Deliver the swap to the worker via a k=0 piggyback request. */
-            uint16_t dummy16[DS4_OFFLOAD_N_EMBD];
-            float dummyf = 0.0f;
-            memset(dummy16, 0, sizeof(dummy16));
-            char err[160] = "";
-            uint64_t seq = ds4_offload_client_request(
-                    ds4_engine_offload_client(e), (int)layer_index,
-                    &dummy16[0], &dummyf, 0, dummy16,
-                    swap_evict, swap_load, swap_k, err, sizeof(err));
-            if (seq) {
-                uint16_t unused[DS4_OFFLOAD_N_EMBD];
-                (void)ds4_offload_client_collect(
-                        ds4_engine_offload_client(e), seq, unused, err, sizeof(err));
-            }
+            /* Stash the swap for the next EXPERT_REQ on this layer. */
+            g_offload_pending_swap[layer_index].pending = true;
+            g_offload_pending_swap[layer_index].evict = swap_evict[0];
+            g_offload_pending_swap[layer_index].load  = swap_load[0];
+            swap_k = 0;  /* consumed; don't send twice */
         }
     }
 
@@ -21883,7 +21896,9 @@ static int metal_graph_routed_moe_or_offload(
             for (uint32_t i = 0; i < n_expert; i++) all_idx[i] = (uint8_t)i;
             offload_log_layer(olog, layer_index, ids16, (int)n_expert,
                               all_idx, (int)n_expert, NULL, 0,
-                              0.0, m1 - slog_m0, 0);
+                              0.0,
+                              ds4_gpu_stream_expert_cache_tail_misses() - slog_t0,
+                              0);
         }
         return rc;
     }
@@ -21897,6 +21912,17 @@ static int metal_graph_routed_moe_or_offload(
     for (int i = 0; i < n_remote; i++) { rids[i] = ids16[remote_idx[i]]; rw[i] = w[remote_idx[i]]; }
     uint16_t hidden16[DS4_OFFLOAD_N_EMBD];
     offload_f32_to_f16(norm, hidden16, DS4_OFFLOAD_N_EMBD);
+
+    /* Merge any deferred swap from a previous n_remote==0 pass on this
+     * layer — piggyback it on this real EXPERT_REQ at zero latency cost. */
+    if (g_offload_pending_swap[layer_index].pending) {
+        if (swap_k < DS4_OFFLOAD_N_USED) {
+            swap_evict[swap_k] = g_offload_pending_swap[layer_index].evict;
+            swap_load[swap_k]  = g_offload_pending_swap[layer_index].load;
+            swap_k++;
+        }
+        g_offload_pending_swap[layer_index].pending = false;
+    }
 
     uint16_t partial16[DS4_OFFLOAD_N_EMBD];
     const double net_t0 = olog ? now_sec() : 0.0;
@@ -21916,7 +21942,9 @@ static int metal_graph_routed_moe_or_offload(
             for (uint32_t i = 0; i < n_expert; i++) all_idx[i] = (uint8_t)i;
             offload_log_layer(olog, layer_index, ids16, (int)n_expert,
                               all_idx, (int)n_expert, NULL, 0,
-                              net_ms, m1 - slog_m0, 1);
+                              net_ms,
+                              ds4_gpu_stream_expert_cache_tail_misses() - slog_t0,
+                              1);
         }
         return rc;
     }
@@ -21964,7 +21992,9 @@ static int metal_graph_routed_moe_or_offload(
         ds4_gpu_stream_expert_cache_hitmiss(&h1, &m1);
         offload_log_layer(olog, layer_index, ids16, (int)n_expert,
                           local_idx, n_local, remote_idx, n_remote,
-                          net_ms, m1 - slog_m0, 0);
+                          net_ms,
+                          ds4_gpu_stream_expert_cache_tail_misses() - slog_t0,
+                          0);
     }
     return rc;
 #undef OFFLOAD_PASSTHROUGH

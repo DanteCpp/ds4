@@ -319,6 +319,7 @@ static uint32_t g_stream_expert_cache_entry_count;
 static uint32_t g_stream_expert_cache_budget_override;
 static uint64_t g_stream_expert_cache_hits;
 static uint64_t g_stream_expert_cache_misses;
+static uint64_t g_stream_expert_cache_tail_misses;  /* subset: SSD-tail only */
 static uint64_t g_stream_expert_cache_evictions;
 static uint64_t g_stream_expert_cache_wraps;
 static uint64_t g_stream_expert_cache_clock;
@@ -10670,6 +10671,10 @@ void ds4_gpu_stream_expert_cache_hitmiss(uint64_t *hits, uint64_t *misses) {
     if (misses) *misses = g_stream_expert_cache_misses;
 }
 
+uint64_t ds4_gpu_stream_expert_cache_tail_misses(void) {
+    return g_stream_expert_cache_tail_misses;
+}
+
 /* Is (layer, expert) currently resident in the streaming RAM cache? Used by the
  * offload coordinator to detect, per expert, which locally-computed experts are
  * about to be read from SSD (not resident) vs served from RAM (resident) — the
@@ -13813,6 +13818,8 @@ ds4_gpu_stream_expert_cache_install_loaded(
     }
     g_stream_expert_cache_misses++;
     g_stream_expert_cache_layer_misses[layer]++;
+    if (ds4_engine_offload_expert_in_ssd_tail((int)layer, (int)expert))
+        g_stream_expert_cache_tail_misses++;
     g_stream_expert_cache_wraps += 3;
     return e;
 }

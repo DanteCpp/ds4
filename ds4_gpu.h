@@ -152,6 +152,10 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void);
  * misses = expert had to be read from SSD. Delta over a layer's local compute
  * attributes that layer's SSD reads (diagnostic; may include readahead noise). */
 void ds4_gpu_stream_expert_cache_hitmiss(uint64_t *hits, uint64_t *misses);
+/* Cumulative streaming-cache misses for experts in the SSD-only tail
+ * (original partition: not in coordinator RAM, not on worker).  A smaller
+ * delta over a local-compute span filters out swap-churn re-reads. */
+uint64_t ds4_gpu_stream_expert_cache_tail_misses(void);
 /* Is (layer, expert) resident in the streaming RAM cache right now? The offload
  * coordinator uses it to detect, per expert, which local experts will be read
  * from SSD (not resident) vs served from RAM — the signal that drives swaps. */
