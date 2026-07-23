@@ -21511,7 +21511,7 @@ static bool     g_offload_swap_checked;
 
 /* Per-layer ring buffer of swaps deferred from n_remote==0 passes.
  * Committed locally, flushed on the next EXPERT_REQ for this layer. */
-#define DS4_PENDING_SWAP_MAX 8
+#define DS4_PENDING_SWAP_MAX 64
 static struct {
     uint8_t head, tail;   /* ring buffer indices; empty when head==tail */
     uint16_t evict[DS4_PENDING_SWAP_MAX];
@@ -21877,21 +21877,29 @@ static int metal_graph_routed_moe_or_offload(
      * deferred swap.  During the gap a demoted Y that gets requested will
      * cause an ERROR -> local-fallback (rare). */
     if (swap_k > 0) {
-        offload_commit_swaps(e, (int)layer_index, swap_evict, swap_load, swap_k);
         if (n_remote == 0) {
-            /* Push onto the per-layer ring buffer; drop oldest if full. */
+            /* Queue for later delivery — commit deferred until the
+             * worker actually receives it, so the bitmap cannot
+             * diverge. */
+            g_offload_pending_swap[layer_index]
+                .evict[g_offload_pending_swap[layer_index].tail] =
+                swap_evict[0];
+            g_offload_pending_swap[layer_index]
+                .load[g_offload_pending_swap[layer_index].tail] =
+                swap_load[0];
             uint8_t next = (g_offload_pending_swap[layer_index].tail + 1)
                            % DS4_PENDING_SWAP_MAX;
-            if (next != g_offload_pending_swap[layer_index].head) {
-                g_offload_pending_swap[layer_index]
-                    .evict[g_offload_pending_swap[layer_index].tail] =
-                    swap_evict[0];
-                g_offload_pending_swap[layer_index]
-                    .load[g_offload_pending_swap[layer_index].tail] =
-                    swap_load[0];
-                g_offload_pending_swap[layer_index].tail = next;
+            if (next == g_offload_pending_swap[layer_index].head) {
+                g_offload_pending_swap[layer_index].head =
+                    (g_offload_pending_swap[layer_index].head + 1)
+                    % DS4_PENDING_SWAP_MAX;
             }
-            swap_k = 0;  /* consumed; don't send twice */
+            g_offload_pending_swap[layer_index].tail = next;
+            swap_k = 0;
+        } else {
+            /* n_remote > 0: commit now, the worker will receive it. */
+            offload_commit_swaps(e, (int)layer_index,
+                                swap_evict, swap_load, swap_k);
         }
     }
 
@@ -21923,7 +21931,10 @@ static int metal_graph_routed_moe_or_offload(
     offload_f32_to_f16(norm, hidden16, DS4_OFFLOAD_N_EMBD);
 
     /* Drain any deferred swaps from previous n_remote==0 passes on this
-     * layer — piggyback them on this real EXPERT_REQ at zero latency cost. */
+     * layer — piggyback them on this real EXPERT_REQ at zero latency cost.
+     * Commit them NOW: the worker is about to receive them, so the bitmap
+     * and the worker's cache stay in lock-step. */
+    int drained = 0;
     while (g_offload_pending_swap[layer_index].head !=
            g_offload_pending_swap[layer_index].tail) {
         if (swap_k < DS4_OFFLOAD_N_USED) {
@@ -21931,12 +21942,17 @@ static int metal_graph_routed_moe_or_offload(
             swap_evict[swap_k] = g_offload_pending_swap[layer_index].evict[h];
             swap_load[swap_k]  = g_offload_pending_swap[layer_index].load[h];
             swap_k++;
+            drained++;
             g_offload_pending_swap[layer_index].head =
                 (h + 1) % DS4_PENDING_SWAP_MAX;
         } else {
             break;  /* swap_evict/load full; remainder stays queued */
         }
     }
+    if (drained > 0)
+        offload_commit_swaps(e, (int)layer_index,
+                            swap_evict + swap_k - drained,
+                            swap_load + swap_k - drained, drained);
 
     uint16_t partial16[DS4_OFFLOAD_N_EMBD];
     const double net_t0 = olog ? now_sec() : 0.0;
