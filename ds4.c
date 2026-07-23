@@ -21625,22 +21625,15 @@ static int offload_plan_swap(ds4_engine *e, int layer,
         g_offload_swap_disabled = getenv("DS4_OFFLOAD_NO_SWAP") != NULL;
         g_offload_swap_checked = true;
     }
-    /* Bump recency for every selected expert first, so the victim searches below
+    /* Bump recency for every selected expert first, so the victim searches
      * never target an expert in active use this layer. */
     const uint64_t tick = ++g_offload_swap_clock;
-    uint64_t prev_lu[DS4_OFFLOAD_N_USED];
     for (int i = 0; i < k; i++) {
         const int x = (int)sel_ids[i];
-        if (x >= 0 && x < DS4_OFFLOAD_N_ROUTED) {
-            prev_lu[i] = g_offload_lu[layer][x];
+        if (x >= 0 && x < DS4_OFFLOAD_N_ROUTED)
             g_offload_lu[layer][x] = tick;
-        } else {
-            prev_lu[i] = tick;
-        }
     }
-    /* Swaps ride on this layer's EXPERT_REQ, so only plan when it fires one
-     * (n_remote > 0); all-local layers still update recency above. */
-    if (g_offload_swap_disabled || n_remote == 0) return 0;
+    if (g_offload_swap_disabled) return 0;
 
     /* Y = the coordinator RAM cache's LRU-coldest expert of this layer: a local
      * (resident) expert that is actually in the streaming RAM cache and not in
@@ -21661,25 +21654,23 @@ static int offload_plan_swap(ds4_engine *e, int layer,
     }
     if (demote_y < 0) return 0;   /* nothing cold enough in L1 to demote */
 
-    /* Case B: a recurring worker (remote) expert is routed -> promote it to L1.
+    /* Case B: a worker (remote) expert is routed -> promote it to L1.
      * Evict it from the worker (it's now served locally) and load Y into its slot. */
     for (int i = 0; i < n_remote; i++) {
         const int pos = (int)remote_idx[i];
         if (pos < 0 || pos >= k) continue;
-        if (prev_lu[pos] == 0) continue;               /* one-off: not worth an SSD promote */
         swap_evict[0] = sel_ids[pos];                  /* promoted expert leaves worker */
         swap_load[0]  = (uint16_t)demote_y;            /* Y takes its slot              */
         return 1;
     }
 
-    /* Case C: a recurring SSD-tier expert is routed (streaming cache promotes it
-     * to L1 locally). Demote Y to the worker, evicting the worker's LRU-coldest
+    /* Case C: an SSD-tier expert is routed -> streaming cache promotes it
+     * to L1 locally. Demote Y to the worker, evicting the worker's LRU-coldest
      * W of this layer to SSD. */
     bool ssd_promote = false;
     for (int i = 0; i < n_local; i++) {
         const int pos = (int)local_idx[i];
         if (pos < 0 || pos >= k) continue;
-        if (prev_lu[pos] == 0) continue;
         if (!ds4_gpu_stream_expert_cache_contains(layer, (int)sel_ids[pos])) { ssd_promote = true; break; }
     }
     if (!ssd_promote) return 0;
