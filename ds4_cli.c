@@ -123,7 +123,7 @@ static ds4_offload_hello cli_offload_hello(ds4_engine *engine) {
     h.n_used = DS4_OFFLOAD_N_USED;
     h.n_embd = (uint32_t)ds4_engine_embd_dim(engine);
     h.n_routed = DS4_OFFLOAD_N_ROUTED;
-    h.partition_hash = 0;
+    h.partition_hash = ds4_engine_offload_partition_id();
     h.model_id = (uint64_t)(uint32_t)ds4_engine_model_id(engine);
     return h;
 }
@@ -138,6 +138,31 @@ static int cli_offload_compute(void *user, int layer, const uint16_t *ids,
 
 static volatile int cli_offload_stop;
 
+/* No SA_RESTART: a blocked accept()/read() in the worker loop returns EINTR so
+ * the loop observes cli_offload_stop and exits cleanly on ^C / SIGTERM (L1). */
+static void cli_offload_sigint(int sig) { (void)sig; cli_offload_stop = 1; }
+
+/* Fill the mlock'd offload expert cache with this node's share of the partition.
+ * Budget 0 = auto: the capacity the caller pinned down beforehand (the worker's
+ * wired budget via set_worker_role, or the loopback coordinator's). Shared by the
+ * worker and the single-process loopback validator. Returns 0 to continue,
+ * non-zero (fatal) on populate error — a partial cache silently returns wrong
+ * experts (H2), so we refuse to serve. */
+static int cli_offload_populate_cache(ds4_engine *engine) {
+    char perr[256] = "";
+    int n = ds4_engine_offload_populate_cache(engine, 0 /* auto */, perr, sizeof(perr));
+    if (n < 0) {
+        fprintf(stderr,
+                "ds4: offload cache populate failed: %s\n"
+                "ds4: refusing to serve -- a partial cache would silently return "
+                "wrong experts. Aborting.\n",
+                perr[0] ? perr : "unknown error");
+        return 3;
+    }
+    fprintf(stderr, "ds4: offload cache populated %d experts\n", n);
+    return 0;
+}
+
 /* Run the expert-compute server (mtwo). Loads the model like any ds4 process;
  * for single-machine loopback dev launch it with --ssd-streaming and a small
  * --ssd-streaming-cache-experts so it never mlocks the production ~27 GB. */
@@ -150,35 +175,19 @@ static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
                 DS4_OFFLOAD_N_EMBD, DS4_OFFLOAD_N_LAYER);
         return 2;
     }
-    /* Optionally pre-populate the mlock'd offload expert cache from the GGUF.
-     * Bounded by DS4_OFFLOAD_CACHE_EXPERTS (0 / unset = disabled, compute reads
-     * straight from the mmap). This is the OOM-safety knob, mirroring
-     * --ssd-streaming-cache-experts. A populate failure is non-fatal: the worker
-     * keeps serving via the direct-mmap compute. */
-    {
-        const char *ce = getenv("DS4_OFFLOAD_CACHE_EXPERTS");
-        uint32_t budget = 0;
-        if (ce && ce[0]) {
-            char *end = NULL;
-            long v = strtol(ce, &end, 10);
-            if (end != ce && *end == '\0' && v > 0) budget = (uint32_t)v;
-        }
-        if (budget) {
-            char perr[256] = "";
-            int n = ds4_engine_offload_populate_cache(engine, budget,
-                                                      perr, sizeof(perr));
-            if (n < 0) {
-                fprintf(stderr,
-                        "ds4: expert-server: offload cache populate failed: %s "
-                        "(serving via direct-mmap compute)\n",
-                        perr[0] ? perr : "unknown error");
-            } else {
-                fprintf(stderr,
-                        "ds4: expert-server: offload cache populated %d experts\n",
-                        n);
-            }
-        }
-    }
+    /* Auto-size the worker's cache to its wired budget, then fill it with the
+     * worker's tier of the hotlist partition. The cache is the sole compute
+     * authority on the worker — the mmap path is invalid in the streaming regime
+     * (H2) — so a populate failure is fatal. */
+    ds4_engine_offload_set_worker_role(engine);
+    if (cli_offload_populate_cache(engine) != 0) return 3;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = cli_offload_sigint;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     ds4_offload_worker_options opt = {0};
     opt.bind_host = cfg->offload.bind;
@@ -2139,6 +2148,11 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4: --perplexity-file does not use -p/--prompt-file\n");
         exit(2);
     }
+    if (c.offload.worker && c.offload.host) {
+        fprintf(stderr, "ds4: --expert-server (worker) and --expert-offload "
+                        "(coordinator) are mutually exclusive\n");
+        exit(2);
+    }
     char tp_err[256];
     if (!ds4_tp_adopt_distributed_options(&c.engine.tp, c.dist,
                                           tp_err, sizeof(tp_err))) {
@@ -2303,6 +2317,23 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4: expert-offload: connect to %s:%d failed (%s); "
                             "running solo\n", cfg.offload.host, offport, offerr);
         }
+    } else if (getenv("DS4_OFFLOAD_LOOPBACK")) {
+        /* Single-process validation of the decode splice (no worker): the
+         * "remote" experts are computed through this process's own offload cache
+         * (the same validated path the worker uses; the mmap path is invalid
+         * under --ssd-streaming, H2). enable_loopback pins the partition caps
+         * (set DS4_OFFLOAD_COORD_EXPERTS + DS4_OFFLOAD_CACHE_EXPERTS), then we
+         * fill the worker tier and decode to confirm parity with a solo run. */
+        ds4_engine_offload_enable_loopback(engine);
+        if (cli_offload_populate_cache(engine) != 0) {
+            ds4_engine_close(engine);
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 3;
+        }
+        fprintf(stderr, "ds4: expert-offload: LOOPBACK mode (remote experts via "
+                        "local offload cache; partition id=%#llx)\n",
+                (unsigned long long)ds4_engine_offload_partition_id());
     }
 
     if (!cfg.inspect) {

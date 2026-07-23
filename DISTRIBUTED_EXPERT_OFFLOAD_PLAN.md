@@ -343,16 +343,25 @@ collects `EXPERT_RESP` by `seq` so per-layer requests can overlap local compute.
 
 ## 9. Implementation roadmap
 
-> **Implementation status (branch `expert-offload`).** The reusable transport
-> core is built and unit-tested off-hardware. The worker's expert compute
-> (Unit B) is written but **unverified** — it reuses the proven per-layer
-> forward `ds4_gpu_routed_moe_one_tensor`, but has not been run against a
-> reference; a per-token hidden-state-hash check (§10) on the model loop is
-> required before trusting it. New files: `ds4_offload.{c,h}` (transport, worker
-> loop, residency table, ping-pong gate), `ds4_offload_ping.c`
-> (`./ds4-offload-ping`). Engine seam: `ds4_engine_offload_compute_experts`
-> (ds4.c) → `ds4_gpu_offload_run_layer` (ds4_metal.m, weak `-1` fallback for
-> non-Metal). Wired into every backend's `CORE_OBJS`.
+> **Implementation status (branch `expert-offload`).** Transport, worker loop,
+> residency table, offload-cache compute (Unit #2, cos=1.0), **and the
+> coordinator decode splice (Unit C)** are landed and validated on `mone`.
+> The splice is a pass-through wrapper `metal_graph_routed_moe_or_offload`
+> (ds4.c) around the two single-node streaming routed calls: offload inactive =
+> byte-for-byte the original (all other regimes untouched); active = split the
+> layer's experts local/remote, ship the 8 KB hidden + remote ids/weights to the
+> worker, compute the resident experts locally with the remote weights zeroed,
+> and add the worker's f16 partial back with an explicit queued GPU add (the
+> routed kernel's own `add_in` addend is inert on this path — a subtle bug found
+> and fixed during validation). Correctness confirmed single-process via a
+> loopback mode (`DS4_OFFLOAD_LOOPBACK`, remote experts computed through the
+> local offload cache): under heavy offload (~64% remote-eligible, ~600 splice
+> firings over 12 tokens) greedy decode is **token-identical** to a solo run and
+> logits match within f16 wire noise (cos 0.99992, max |Δlogit| ~0.5). The only
+> unproven piece is the TCP hop itself (pure network, no Metal) + the worker's
+> cache compute (already cos=1.0) — i.e. the two-machine run. New files:
+> `ds4_offload.{c,h}`, `ds4_offload_ping.c` (`./ds4-offload-ping`). Wired into
+> every backend's `CORE_OBJS`.
 
 **Phase 0 — Measure & de-risk (0.5 day).**
 - [x] Real TCP `TCP_NODELAY` ping-pong bouncing an 8 KB buffer over `bridge0`
@@ -370,24 +379,34 @@ collects `EXPERT_RESP` by `seq` so per-layer requests can overlap local compute.
 - [x] New `ds4_offload.c` transport (persistent `TCP_NODELAY` socket, frames §8).
 - [x] Worker expert-server loop (no attention/KV/graph): `ds4_offload_worker_run`,
       one coordinator at a time, replies before background evict-load (§5.3, §6).
-- [~] Worker expert compute (Unit B): `ds4_gpu_offload_run_layer` reuses the
-      proven per-layer forward with an explicit selected/weights set (padding k
-      up to n_expert_used with weight-0 slots). **Written, unverified** — needs
-      the hidden-state-hash check.
+- [x] Worker expert compute (Unit #2): `ds4_gpu_offload_cache_run_layer` reads
+      the mlock'd offload cache via the slots6 kernels (cos=1.0 vs mmap). The
+      worker serves *only* from the cache (the mmap path is invalid under
+      streaming, H2); a miss is an ERROR status, never silent garbage (H1).
 - [x] Residency table + O(k) local/remote split (`ds4_offload_residency_*`, §5.1).
-- [~] New engine mode: `--expert-offload` (coord) / `--role expert-server` (worker).
-      *transport + worker loop done; CLI wiring into `ds4.c` still to do.*
-- [ ] Partition experts by the hotlist: hottest ~64% → mone mlock, rest → mtwo.
-- [~] Feed the MoE kernels the residency bitmap (replace the static ownership test).
-      *bitmap API done; feeding the live Metal kernel is the open seam.*
-- [~] Redirect `split_missing` from SSD `pread` to `EXPERT_REQ`/`EXPERT_RESP`.
-      *client API (`ds4_offload_client_request`/`_collect`) done; the redirect in
-      `ds4_metal.m` and a registered Metal expert-compute callback are the open seam.*
-- [x] Overlap: issue request before local expert compute — supported by the async
-      request/collect split (issue several `_request`s, then `_collect` by seq);
-      exercised in the module self-test.
-- **Exit:** correct logits (hidden-state hash vs single-machine reference),
-      ≥ ~18 t/s.
+- [x] New engine mode: `--expert-offload` (coord) / `--expert-server` (worker) —
+      CLI wired, HELLO carries the partition id, mutually exclusive, in `--help`.
+- [x] Partition experts, RAM-first (hotlist-ranked): every (layer,expert) is
+      ranked by the flash hotlist (hottest first; unranked experts appended
+      deterministically so all 11008 get a rank). The coordinator caches the
+      hottest `coord_cap`, the worker the next `worker_cap`, and only the cold
+      tail beyond both caches streams from SSD. **Both caches auto-size to the
+      machine's wired budget by default** (`offload_compute_capacities`); the
+      peer's capacity is read from env (`DS4_OFFLOAD_COORD_EXPERTS` /
+      `DS4_OFFLOAD_CACHE_EXPERTS`) and HELLO's partition id aborts on a mismatch.
+      Automatic capacity negotiation at HELLO (dropping the peer-env) is the
+      remaining nicety.
+- [x] Feed the residency to the live decode: `metal_graph_routed_moe_or_offload`
+      splits the routed experts and computes only the resident ones locally
+      (remote weights zeroed).
+- [x] Redirect the missing slice from SSD to the worker: the wrapper issues
+      `EXPERT_REQ` for the remote experts and adds `EXPERT_RESP` back into the
+      routed output (explicit GPU add — the kernel `add_in` addend is inert here).
+- [~] Overlap: request is issued then collected around the *local* compute, but
+      the current wrapper collects before the routed kernel runs (add-back needs
+      the partial), so RTT is not yet hidden. Overlap is the next perf step.
+- **Exit:** correct logits — **DONE** (loopback: token-identical to solo, cos
+      0.99992). Two-machine `≥ ~18 t/s` is the remaining hardware measurement.
 
 **Phase 2 — Dynamic LRU swaps (2 days).**
 - [ ] Promote-on-first-hit wired to background SSD paging; carry the LRU victim as

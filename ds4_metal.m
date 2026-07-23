@@ -635,6 +635,7 @@ static uint32_t g_offload_expert_cache_resident;
 static bool     g_offload_expert_cache_active;
 static uint64_t g_offload_expert_cache_hits;
 static uint64_t g_offload_expert_cache_misses;
+static uint64_t g_offload_expert_cache_mlock_fail_bytes; /* M2: unlocked slab bytes */
 static uint64_t g_stream_expert_cache_layer_hits[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_misses[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_evictions[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -11683,6 +11684,7 @@ static id<MTLBuffer> ds4_gpu_offload_cache_alloc_slot(uint64_t  slot_bytes,
          * is bounded by RLIMIT_MEMLOCK, so a failure only costs pageability). */
         void *contents = slab_buffer.contents;
         if (contents && mlock(contents, (size_t)slab_buffer.length) != 0) {
+            g_offload_expert_cache_mlock_fail_bytes += (uint64_t)slab_buffer.length;
             fprintf(stderr,
                     "ds4: offload expert cache mlock failed (%.2f MiB): %s "
                     "(continuing unlocked)\n",
@@ -11730,6 +11732,13 @@ void ds4_gpu_offload_cache_reset(void) {
     g_offload_expert_cache_active = false;
     g_offload_expert_cache_hits = 0;
     g_offload_expert_cache_misses = 0;
+    g_offload_expert_cache_mlock_fail_bytes = 0;
+}
+
+/* M2: total slab bytes that failed to mlock (0 = fully wired). A non-zero value
+ * means part of the cache is pageable, defeating "no SSD on the critical path". */
+uint64_t ds4_gpu_offload_cache_mlock_failed_bytes(void) {
+    return g_offload_expert_cache_mlock_fail_bytes;
 }
 
 int ds4_gpu_offload_cache_configure(uint64_t gate_expert_bytes,
@@ -11829,8 +11838,10 @@ int ds4_gpu_offload_cache_install_expert(int layer, int expert,
                                           contents + up_inner, &rb, &ms) ||
         !ds4_gpu_stream_expert_pread_into(down_abs_offset, down_expert_bytes,
                                           contents + down_inner, &rb, &ms)) {
-        /* The slot was consumed but never validated; a populate error is fatal
-         * to startup so the leaked slot never matters. */
+        /* The slot was consumed but never validated. The caller
+         * (ds4_engine_offload_populate_cache -> run_offload_worker) treats any
+         * populate error as fatal and aborts the process, so the one leaked slot
+         * is reclaimed by exit and never reused. */
         if (err) snprintf(err, errlen,
                           "offload cache: pread failed for layer %d expert %d",
                           layer, expert);

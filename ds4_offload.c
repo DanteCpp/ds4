@@ -85,6 +85,17 @@ static void off_socket_tune(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
 }
 
+/* Bound a blocking read so a dead/powered-off worker surfaces as a transport
+ * error (worker-drop) in seconds instead of the kernel's multi-minute TCP
+ * timeout (M7). Only set on the coordinator client fd — the worker's server
+ * connection is intentionally allowed to idle between tokens. */
+static void off_set_rcvtimeo(int fd, double sec) {
+    struct timeval tv;
+    tv.tv_sec = (time_t)sec;
+    tv.tv_usec = (suseconds_t)((sec - (double)tv.tv_sec) * 1.0e6);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
 static int off_listen(const char *host, int port, char *err, size_t errlen) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
@@ -278,7 +289,8 @@ static int off_handshake(int fd, const ds4_offload_hello *mine,
 /* Max REQ payload: 2 + 8 + 1 + k*2 + k*4 + 8192 + 1 + k*2 with k<=N_USED. */
 #define OFF_REQ_MAX (2 + 8 + 1 + DS4_OFFLOAD_N_USED * 8 + \
                      (int)DS4_OFFLOAD_HIDDEN_F16_BYTES + 1)
-#define OFF_RESP_MAX (8 + (int)DS4_OFFLOAD_HIDDEN_F16_BYTES)
+/* RESP: seq u64, status u8, y[n_embd] f16 (§8, H1). */
+#define OFF_RESP_MAX (8 + 1 + (int)DS4_OFFLOAD_HIDDEN_F16_BYTES)
 
 static uint32_t off_pack_req(unsigned char *out, int layer, uint64_t seq,
                              const uint16_t *ids, const float *weights, int k,
@@ -332,8 +344,9 @@ static int off_unpack_req(const unsigned char *in, uint32_t bytes,
  * Coordinator client.
  * --------------------------------------------------------------------- */
 
-/* One outstanding response slot per seq, buffered so responses can arrive out
- * of order relative to the layer that issued them (overlap, §7). */
+/* Persistent coordinator->worker connection. Requests are issued under `lock`
+ * (monotonic `next_seq`) and responses collected in-order on the same stream
+ * (§7); the lock keeps a future multi-threaded issuer from interleaving frames. */
 struct ds4_offload_client {
     int fd;
     uint64_t next_seq;
@@ -352,6 +365,9 @@ ds4_offload_client *ds4_offload_client_connect(const char *host, int port,
         close(fd);
         return NULL;
     }
+    /* Generous vs one round trip (sub-ms) but far below the kernel TCP timeout,
+     * so a worker that dies mid-run fails the next collect rather than hanging. */
+    off_set_rcvtimeo(fd, 15.0);
     ds4_offload_client *c = calloc(1, sizeof(*c));
     if (!c) {
         off_set_err(err, errlen, "offload client: out of memory");
@@ -401,7 +417,11 @@ uint64_t ds4_offload_client_request(ds4_offload_client *c, int layer,
  * worker replies in receive order, so collecting the next EXPERT_RESP and
  * checking its seq is sufficient and keeps the client lock-simple. Overlap
  * across layers still works because the coordinator issues several requests
- * before collecting the first (the sends are queued on the socket). */
+ * before collecting the first (the sends are queued on the socket).
+ *
+ * Returns 0 on success, -1 on transport error (bad/timed-out/closed socket —
+ * treat as worker-drop), +1 when the worker replied with an ERROR status (H1;
+ * likewise a worker-drop signal — the coordinator must not use `out_f16`). */
 int ds4_offload_client_collect(ds4_offload_client *c, uint64_t seq,
                                uint16_t *out_f16, char *err, size_t errlen) {
     if (!c) {
@@ -428,7 +448,13 @@ int ds4_offload_client_collect(ds4_offload_client *c, uint64_t seq,
                     (unsigned long long)seq, (unsigned long long)got);
         return -1;
     }
-    memcpy(out_f16, resp + 8, DS4_OFFLOAD_HIDDEN_F16_BYTES);
+    if (resp[8] != DS4_OFFLOAD_STATUS_OK) {
+        off_set_err(err, errlen,
+                    "offload collect: worker reported compute error (seq %llu)",
+                    (unsigned long long)seq);
+        return 1;
+    }
+    memcpy(out_f16, resp + 9, DS4_OFFLOAD_HIDDEN_F16_BYTES);
     return 0;
 }
 
@@ -512,11 +538,22 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                 continue;
             }
 
-            /* Critical path: compute the routed experts and reply FIRST (§5.3). */
-            if (opt->compute(opt->user, layer, ids, weights, k, hidden, out) != 0)
+            /* Critical path: compute the routed experts and reply FIRST (§5.3).
+             * A compute failure (GPU error, or the requested expert not resident
+             * in this worker's cache — the invalid-mmap case, H1/H2) is reported
+             * as an ERROR status, never as a valid-looking zero vector, so the
+             * coordinator never folds silent garbage into the residual. */
+            uint8_t status = DS4_OFFLOAD_STATUS_OK;
+            if (opt->compute(opt->user, layer, ids, weights, k, hidden, out) != 0) {
+                status = DS4_OFFLOAD_STATUS_ERROR;
                 memset(out, 0, DS4_OFFLOAD_HIDDEN_F16_BYTES);
+                fprintf(stderr,
+                        "ds4-offload: expert compute failed (layer %d k=%d); "
+                        "replying ERROR\n", layer, k);
+            }
             memcpy(respbuf, &seq, 8);
-            memcpy(respbuf + 8, out, DS4_OFFLOAD_HIDDEN_F16_BYTES);
+            respbuf[8] = status;
+            memcpy(respbuf + 9, out, DS4_OFFLOAD_HIDDEN_F16_BYTES);
             if (!off_send_frame(cfd, DS4_OFFLOAD_FRAME_EXPERT_RESP, respbuf,
                                 OFF_RESP_MAX))
                 break;

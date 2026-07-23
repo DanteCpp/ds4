@@ -60,7 +60,14 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    signal(SIGINT, on_sigint);
+    /* sigaction WITHOUT SA_RESTART so a blocked accept()/read() returns EINTR
+     * and the g_stop check fires; plain signal() restarts the syscall on macOS
+     * and the server would never stop on ^C. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = on_sigint;
+    sigaction(SIGINT, &sa, NULL);
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 #endif

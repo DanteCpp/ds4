@@ -4394,13 +4394,6 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
     return (t->dim[0] / info->block_elems) * routed_expert_block_bytes(t->type);
 }
 
-/* Unit B self-test (EXPERT_OFFLOAD_HANDOFF.md Step 1). Called from each decode
- * routed-MoE path right after the routed call: recompute the layer's pure routed
- * sum via ds4_gpu_offload_run_layer (the worker compute) on the f16-roundtripped
- * hidden, and diff against the decode's routed_out. Confirms the command-buffer
- * lifecycle (unknown #2) and quantifies the f16 wire error. Gated by env, zero
- * work when off (one int compare):
- *   DS4_OFFLOAD_SELFTEST_LAYER=<il> (default off), DS4_OFFLOAD_SELFTEST_TOKENS=<n> (default 4). */
 /* Unit B self-test (EXPERT_OFFLOAD_HANDOFF.md Step 1). The decode routed-MoE
  * paths call ds4_offload_selftest_capture() right after the routed call to grab
  * the real (ffn_norm, router_selected, router_weights, routed_out) via sync
@@ -21463,6 +21456,225 @@ typedef enum {
     METAL_DECODE_LAYER_FROM_ROUTER,
 } metal_decode_layer_phase;
 
+/* ------------------------------------------------------------------------
+ * Distributed expert offload — coordinator decode splice (Unit C, plan §3/§5.2).
+ *
+ * A pass-through wrapper around ds4_gpu_routed_moe_one_tensor: when offload is
+ * inactive it is byte-for-byte the original call (every existing regime is
+ * unchanged, AGENT.md), so only the two single-node streaming call sites are
+ * rewired. When active on the coordinator, it splits the layer's routed experts
+ * into local (resident) and remote (worker) via the residency bitmap, ships the
+ * 8 KB normalized hidden + remote (id,weight) to the worker, computes the local
+ * experts on-GPU with the remote weights zeroed, and folds the worker's f16
+ * partial back in through the routed kernel's `add_in` addend (the same path TP
+ * uses) — one kernel, out = local_sum + remote_partial. Any wire error falls
+ * back to a full local compute, so correctness never depends on the worker.
+ * --------------------------------------------------------------------- */
+
+/* The decode layer phase runs deep in the Metal graph orchestration with no
+ * engine handle; the coordinator stashes its engine here while offload is bound
+ * (one model instance at a time — the instance lock guarantees it). */
+static ds4_engine *g_offload_engine;
+
+/* Expert partition, RAM-first with SSD as the cold backstop (plan §2, user
+ * directive). Experts are ranked by the flash hotlist (hottest first). The
+ * coordinator caches the hottest `g_offload_coord_cap` (its wired budget); the
+ * worker caches the next `g_offload_worker_cap` (its wired budget); anything
+ * colder than the two caches combined — and any expert absent from the hotlist —
+ * stays local and is streamed from the coordinator's SSD only when actually
+ * touched (the last resort). Both caps default to the max the machine's wired
+ * limit allows and are carried in HELLO so a mismatched split aborts.
+ *
+ * `is_remote` therefore means precisely "held by the worker": rank in
+ * [coord_cap, coord_cap+worker_cap). Hotter → coordinator-resident; colder →
+ * coordinator-local-but-SSD. The caps are set by offload_compute_capacities()
+ * once the model (expert byte size) and wired limit are known. */
+static uint32_t g_offload_coord_cap;    /* experts cached on the coordinator  */
+static uint32_t g_offload_worker_cap;   /* experts cached on the worker       */
+
+/* Global rank of (layer, expert): index in the flash hotlist for ranked experts,
+ * then the hotlist-absent (coldest) experts appended in a deterministic
+ * (layer, expert) order so EVERY expert gets a distinct rank in [0, 11008). Both
+ * nodes build the identical table, so the capacity windows cover the whole model
+ * when combined RAM allows, and only the true tail spills to SSD. */
+static int offload_hotlist_rank(int layer, int expert) {
+    static int rank[DS4_OFFLOAD_N_LAYER][DS4_OFFLOAD_N_ROUTED];
+    static bool built;
+    if (!built) {
+        for (int l = 0; l < DS4_OFFLOAD_N_LAYER; l++)
+            for (int x = 0; x < DS4_OFFLOAD_N_ROUTED; x++) rank[l][x] = INT_MAX;
+        for (uint32_t i = 0; i < ds4_default_streaming_hotlist_flash_count; i++) {
+            int l = ds4_default_streaming_hotlist_flash[i][0];
+            int x = ds4_default_streaming_hotlist_flash[i][1];
+            if (l >= 0 && l < DS4_OFFLOAD_N_LAYER && x >= 0 && x < DS4_OFFLOAD_N_ROUTED &&
+                rank[l][x] == INT_MAX)
+                rank[l][x] = (int)i;
+        }
+        int next = (int)ds4_default_streaming_hotlist_flash_count;
+        for (int l = 0; l < DS4_OFFLOAD_N_LAYER; l++)
+            for (int x = 0; x < DS4_OFFLOAD_N_ROUTED; x++)
+                if (rank[l][x] == INT_MAX) rank[l][x] = next++;
+        built = true;
+    }
+    if (layer < 0 || layer >= DS4_OFFLOAD_N_LAYER ||
+        expert < 0 || expert >= DS4_OFFLOAD_N_ROUTED) return INT_MAX;
+    return rank[layer][expert];
+}
+
+static bool offload_expert_is_remote(int layer, int expert) {
+    const int r = offload_hotlist_rank(layer, expert);
+    const long lo = (long)g_offload_coord_cap;
+    const long hi = lo + (long)g_offload_worker_cap;
+    return (long)r >= lo && (long)r < hi;
+}
+
+/* f32 -> f16 and f16 -> f32 for the 8 KB wire hidden/partial (matches §8). */
+static void offload_f32_to_f16(const float *in, uint16_t *out, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) { _Float16 h = (_Float16)in[i]; memcpy(&out[i], &h, sizeof(h)); }
+}
+static void offload_f16_to_f32(const uint16_t *in, float *out, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) { _Float16 h; memcpy(&h, &in[i], sizeof(h)); out[i] = (float)h; }
+}
+
+/* Fetch the weighted sum of the remote experts from the worker (or, with no
+ * client bound, compute it locally via ds4_engine_offload_compute_experts — the
+ * single-process loopback used to validate the splice arithmetic here on mone,
+ * which reads the local offload cache the same way the worker does).
+ * Returns 0 on success (out16 = f16 partial), non-zero to trigger local fallback. */
+static int offload_fetch_remote_partial(ds4_engine *e, int layer,
+                                        const uint16_t *ids, const float *w, int k,
+                                        const uint16_t *hidden_f16, uint16_t *out16) {
+    ds4_offload_client *c = ds4_engine_offload_client(e);
+    if (c) {
+        char err[160] = "";
+        uint64_t seq = ds4_offload_client_request(c, layer, ids, w, k, hidden_f16,
+                                                  NULL, 0, err, sizeof(err));
+        if (seq == 0) { fprintf(stderr, "ds4: offload request L%d: %s\n", layer, err); return -1; }
+        int rc = ds4_offload_client_collect(c, seq, out16, err, sizeof(err));
+        if (rc != 0) { fprintf(stderr, "ds4: offload collect L%d: %s\n", layer, err); return -1; }
+        return 0;
+    }
+    return ds4_engine_offload_compute_experts(e, layer, ids, w, k, hidden_f16, out16);
+}
+
+/* See the block comment above. Signature is identical to
+ * ds4_gpu_routed_moe_one_tensor so the streaming call sites just rename to it. */
+static int metal_graph_routed_moe_or_offload(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
+        uint32_t layer_index, bool force_resident) {
+    ds4_engine *e = g_offload_engine;
+#define OFFLOAD_PASSTHROUGH() \
+    ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size, \
+        gate_offset, up_offset, down_offset, gate_type, down_type, \
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, \
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights, \
+        n_total_expert, n_expert, clamp, x, add_in, layer_index, force_resident)
+
+    /* Only the plain routed path (no pre-existing addend) of the DeepSeek-V4-Flash
+     * geometry is offloaded; anything else, or offload inactive, is the untouched
+     * original. The fixed n_embd/n_used keep the scratch below stack-safe. */
+    if (!e || !ds4_engine_offload_active(e) || add_in != NULL || !x || !selected ||
+        !weights || n_expert == 0 || n_expert > DS4_OFFLOAD_N_USED ||
+        out_dim != DS4_OFFLOAD_N_EMBD || DS4_N_EMBD != DS4_OFFLOAD_N_EMBD) {
+        return OFFLOAD_PASSTHROUGH();
+    }
+
+    /* Commit pending work so the router selection + normalized hidden are
+     * host-readable (same sync the CPU-router path performs). */
+    if (ds4_gpu_end_commands() == 0) return OFFLOAD_PASSTHROUGH();
+
+    int32_t sel[DS4_OFFLOAD_N_USED];
+    float   w[DS4_OFFLOAD_N_USED];
+    float   norm[DS4_OFFLOAD_N_EMBD];
+    if (ds4_gpu_tensor_read(selected, 0, sel, (uint64_t)n_expert * sizeof(sel[0])) == 0 ||
+        ds4_gpu_tensor_read(weights, 0, w, (uint64_t)n_expert * sizeof(w[0])) == 0 ||
+        ds4_gpu_tensor_read(x, 0, norm, (uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(norm[0])) == 0) {
+        if (ds4_gpu_begin_commands() == 0) return 0;
+        return OFFLOAD_PASSTHROUGH();
+    }
+
+    uint16_t ids16[DS4_OFFLOAD_N_USED];
+    for (uint32_t i = 0; i < n_expert; i++) ids16[i] = (uint16_t)sel[i];
+    uint8_t local_idx[DS4_OFFLOAD_N_USED], remote_idx[DS4_OFFLOAD_N_USED];
+    int n_local = 0, n_remote = 0;
+    ds4_offload_residency_split(ds4_engine_offload_residency(e), (int)layer_index,
+                                ids16, (int)n_expert, local_idx, &n_local,
+                                remote_idx, &n_remote);
+
+    if (n_remote == 0) {          /* all experts resident: plain local compute */
+        if (ds4_gpu_begin_commands() == 0) return 0;
+        return OFFLOAD_PASSTHROUGH();
+    }
+    if (getenv("DS4_OFFLOAD_DEBUG")) {
+        static uint64_t fired;
+        fprintf(stderr, "ds4: offload splice L%u n_remote=%d (fire #%llu)\n",
+                layer_index, n_remote, (unsigned long long)++fired);
+    }
+
+    uint16_t rids[DS4_OFFLOAD_N_USED]; float rw[DS4_OFFLOAD_N_USED];
+    for (int i = 0; i < n_remote; i++) { rids[i] = ids16[remote_idx[i]]; rw[i] = w[remote_idx[i]]; }
+    uint16_t hidden16[DS4_OFFLOAD_N_EMBD];
+    offload_f32_to_f16(norm, hidden16, DS4_OFFLOAD_N_EMBD);
+
+    uint16_t partial16[DS4_OFFLOAD_N_EMBD];
+    if (offload_fetch_remote_partial(e, (int)layer_index, rids, rw, n_remote,
+                                     hidden16, partial16) != 0) {
+        /* Worker drop / error: full local compute is still correct (§Phase-3). */
+        if (ds4_gpu_begin_commands() == 0) return 0;
+        return OFFLOAD_PASSTHROUGH();
+    }
+
+    /* Zero the remote experts' weights so the local kernel contributes only the
+     * resident experts, and stage the worker's f16 partial as f32. The routed
+     * kernel's own add_in addend is honored only in a narrow fused variant (it is
+     * silently inert here), so the partial is added with an explicit GPU add
+     * queued right after the local compute. */
+    static ds4_gpu_tensor *partial_t;
+    if (!partial_t) {
+        partial_t = ds4_gpu_tensor_alloc((uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(float));
+        if (!partial_t) { if (ds4_gpu_begin_commands() == 0) return 0; return OFFLOAD_PASSTHROUGH(); }
+    }
+    float partf[DS4_OFFLOAD_N_EMBD];
+    offload_f16_to_f32(partial16, partf, DS4_OFFLOAD_N_EMBD);
+    float wz[DS4_OFFLOAD_N_USED];
+    memcpy(wz, w, (size_t)n_expert * sizeof(w[0]));
+    for (int i = 0; i < n_remote; i++) wz[remote_idx[i]] = 0.0f;
+    if (getenv("DS4_OFFLOAD_DEBUG")) {
+        double pn = 0.0;
+        for (uint32_t i = 0; i < DS4_OFFLOAD_N_EMBD; i++) pn += (double)partf[i] * partf[i];
+        fprintf(stderr, "ds4:   L%u |partial|=%.4f n_remote=%d\n",
+                layer_index, sqrt(pn), n_remote);
+    }
+    if (ds4_gpu_tensor_write(partial_t, 0, partf, (uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(float)) == 0 ||
+        ds4_gpu_tensor_write((ds4_gpu_tensor *)weights, 0, wz,
+                             (uint64_t)n_expert * sizeof(float)) == 0) {
+        if (ds4_gpu_begin_commands() == 0) return 0;
+        return 0;
+    }
+
+    if (ds4_gpu_begin_commands() == 0) return 0;
+    /* Local resident experts only (remote weights zeroed). */
+    int rc = ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, clamp, x, NULL, layer_index, force_resident);
+    if (rc == 0) return 0;
+    /* out += worker's remote partial (queued GPU add, same command stream). */
+    return ds4_gpu_add_tensor(out, out, partial_t, DS4_OFFLOAD_N_EMBD);
+#undef OFFLOAD_PASSTHROUGH
+}
+
 static bool metal_graph_encode_decode_layer_phase(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -23325,7 +23537,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
         }
         DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
-        if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+        if (ok) ok = metal_graph_routed_moe_or_offload(metal_graph_routed_out(g),
                                                      metal_graph_routed_gate(g),
                                                      metal_graph_routed_up(g),
                                                      metal_graph_routed_mid(g),
@@ -23531,7 +23743,7 @@ static bool metal_graph_encode_decode_layer_phase(
                             DS4_N_EXPERT_USED) != 0;
             }
         }
-        if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+        if (ok) ok = metal_graph_routed_moe_or_offload(metal_graph_routed_out(g),
                                                      metal_graph_routed_gate(g),
                                                      metal_graph_routed_up(g),
                                                      metal_graph_routed_mid(g),
@@ -23625,7 +23837,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool tp_fold_ffn = tp_split_shared &&
                              !keep_ffn_out &&
                              !metal_graph_directional_steering_ffn_enabled(g);
-    if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
+    if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = metal_graph_routed_moe_or_offload(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
                                                  metal_graph_routed_mid(g),
@@ -35398,14 +35610,108 @@ struct ds4_engine {
     ds4_offload_residency offload_residency;
 };
 
+static uint64_t glm_graph_wired_limit_bytes(void);   /* fwd: defined below */
+
+/* Max experts fitting `budget_bytes` at this model's per-expert size. */
+static uint32_t offload_experts_for_bytes(ds4_engine *e, uint64_t budget_bytes) {
+    uint64_t g = 0, d = 0;
+    if (!e || !streaming_layer_gate_down_expert_bytes(&e->weights.layer[0], &g, &d))
+        return 0;
+    const uint64_t per = g * 2ull + d;
+    if (per == 0) return 0;
+    uint64_t n = budget_bytes / per;
+    const uint64_t model_max = (uint64_t)DS4_N_LAYER * DS4_N_EXPERT;
+    if (n > model_max) n = model_max;
+    return (uint32_t)n;
+}
+
+/* Read an env override (expert count), else 0. */
+static uint32_t offload_env_experts(const char *name) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return 0;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v || *end != '\0' || n <= 0) return 0;
+    return (uint32_t)n;
+}
+
+/* Set the coordinator/worker cache capacities. Each machine auto-sizes its OWN
+ * cache to the max its wired limit allows (RAM-first, per the directive); the
+ * peer's capacity comes from an env the operator sets identically on both
+ * (DS4_OFFLOAD_COORD_EXPERTS / DS4_OFFLOAD_CACHE_EXPERTS), and HELLO's partition
+ * id (below) aborts the run if the two sides disagree. `self_is_worker` picks
+ * which capacity this machine auto-fills. */
+static void offload_compute_capacities(ds4_engine *e, bool self_is_worker) {
+    /* Reserve headroom over the mlock'd expert cache for the OS, the mmap'd
+     * backbone working set, and transient staging. */
+    const uint64_t reserve = 6ull * 1024 * 1024 * 1024;
+    const uint64_t wired = glm_graph_wired_limit_bytes();
+    const uint64_t budget = wired > reserve ? wired - reserve : 0;
+    const uint32_t automax = offload_experts_for_bytes(e, budget);
+
+    uint32_t coord = offload_env_experts("DS4_OFFLOAD_COORD_EXPERTS");
+    uint32_t worker = offload_env_experts("DS4_OFFLOAD_CACHE_EXPERTS");
+    if (self_is_worker) { if (!worker) worker = automax; }
+    else                { if (!coord)  coord  = automax; }
+    g_offload_coord_cap = coord;
+    g_offload_worker_cap = worker;
+    fprintf(stderr,
+            "ds4: offload partition: coordinator caches %u hottest experts, "
+            "worker caches next %u (rest stream from SSD). %s auto-sized to %u.\n",
+            g_offload_coord_cap, g_offload_worker_cap,
+            self_is_worker ? "worker" : "coordinator", automax);
+}
+
+/* Seed the residency bitmap from the hotlist partition: the hottest experts
+ * (rank < coord_cap) are coordinator-resident, the worker's tier is remote, and
+ * the coldest stay local (streamed from SSD). offload_compute_capacities() must
+ * run first. */
+void ds4_engine_offload_seed_residency(ds4_engine *e) {
+    if (!e) return;
+    ds4_offload_residency_clear(&e->offload_residency);
+    for (int layer = 0; layer < (int)DS4_N_LAYER; layer++)
+        for (int x = 0; x < (int)DS4_N_EXPERT; x++)
+            ds4_offload_residency_set(&e->offload_residency, layer, x,
+                                      !offload_expert_is_remote(layer, x));
+}
+
 void ds4_engine_offload_bind(ds4_engine *e, ds4_offload_client *client) {
     if (!e) return;
     e->offload_client = client;
     e->offload_active = (client != NULL);
+    offload_compute_capacities(e, false /* coordinator */);
+    ds4_engine_offload_seed_residency(e);
+    g_offload_engine = e->offload_active ? e : NULL;
+}
+
+/* Single-process loopback: mark offload active with no worker client, so the
+ * decode splice runs and computes the "remote" partial through the coordinator's
+ * own offload cache. Validates the split/zero/add arithmetic on-box (mone)
+ * without a second model process (forbidden by the instance lock, AGENT.md). */
+void ds4_engine_offload_enable_loopback(ds4_engine *e) {
+    if (!e) return;
+    e->offload_client = NULL;
+    e->offload_active = true;
+    offload_compute_capacities(e, false /* coordinator role for the partition */);
+    ds4_engine_offload_seed_residency(e);
+    g_offload_engine = e;
 }
 
 bool ds4_engine_offload_active(const ds4_engine *e) {
-    return e && e->offload_active && e->offload_client;
+    return e && e->offload_active;
+}
+
+/* Worker role: auto-size this machine's offload cache to its wired budget and
+ * pin down the partition capacities. Call before populate/HELLO. */
+void ds4_engine_offload_set_worker_role(ds4_engine *e) {
+    offload_compute_capacities(e, true /* worker */);
+}
+
+/* Identity of the expert partition, carried in HELLO.partition_hash so the
+ * coordinator and worker abort if configured with different cache capacities
+ * (which would misroute the worker's tier). */
+uint64_t ds4_engine_offload_partition_id(void) {
+    return ((uint64_t)g_offload_coord_cap << 32) | (uint64_t)g_offload_worker_cap;
 }
 
 ds4_offload_client *ds4_engine_offload_client(const ds4_engine *e) {
@@ -56430,14 +56736,16 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
     const uint64_t down_expert_bytes = l->ffn_down_exps->dim[1] * down_row_bytes;
 
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    /* Prefer the mlock'd offload cache when it is populated (Unit #2, validated
-     * cos=1.0 vs the mmap path). It reads only the resident slabs, so it is
-     * correct and fast in any regime. Fall back to the mmap path when the cache
-     * is empty or a requested expert is not resident here (rc==1). */
+    /* When an offload cache is configured (budget>0) it is the SOLE authority
+     * for this worker: the model is not fully Metal-resident on the worker, so
+     * the direct-mmap path is invalid in the SSD-streaming regime (routed
+     * experts are not in the mmap). Serve only from the mlock'd cache (Unit #2,
+     * validated cos=1.0); a miss is a hard error (-1 -> EXPERT_RESP ERROR, H1),
+     * never a silent zero/garbage vector folded into the residual (H2). */
     {
-        uint32_t resident = 0;
-        ds4_gpu_offload_cache_stats(&resident, NULL, NULL, NULL);
-        if (resident > 0) {
+        uint32_t resident = 0, budget = 0;
+        ds4_gpu_offload_cache_stats(&resident, &budget, NULL, NULL);
+        if (budget > 0) {
             const int rc = ds4_gpu_offload_cache_run_layer(
                     l->ffn_gate_exps->type, l->ffn_down_exps->type,
                     gate_row_bytes, gate_expert_bytes, down_row_bytes, down_expert_bytes,
@@ -56447,11 +56755,17 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
                     DS4_SWIGLU_CLAMP_EXP, layer,
                     expert_ids, weights, k, hidden_f16, out_f16);
             if (rc == 0) return 0;      /* served from the offload cache */
-            /* rc==1 (expert not resident) or rc<0: fall through to mmap. */
+            fprintf(stderr,
+                    "ds4: offload worker: layer %d expert not resident in cache "
+                    "(rc=%d); refusing to serve from the invalid mmap path\n",
+                    layer, rc);
+            return -1;
         }
     }
 #endif
 
+    /* No offload cache configured: single-machine/dev where the full model is
+     * mapped and mmap compute is valid (also the non-Metal weak fallback). */
     return ds4_gpu_offload_run_layer(
             e->model.map, e->model.size,
             l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -56478,6 +56792,9 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
         if (err) snprintf(err, errlen, "offload populate: null engine");
         return -1;
     }
+    /* budget 0 = auto: fill this worker's cache to its capacity (set by
+     * ds4_engine_offload_set_worker_role before populate). */
+    if (budget_experts == 0) budget_experts = g_offload_worker_cap;
     if (budget_experts == 0) return 0;
 
     const int n_layer = ds4_engine_layer_count(e);
@@ -56485,6 +56802,17 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
         if (err) snprintf(err, errlen,
                           "offload populate: unexpected layer count %d", n_layer);
         return -1;
+    }
+
+    /* M1: clamp the budget to the model's true expert count so a stray env value
+     * cannot ask for more experts than exist (and, below, cannot overcommit
+     * RAM). 43 layers x 256 routed = 11008 max. */
+    const uint32_t max_experts = (uint32_t)n_layer * (uint32_t)DS4_N_EXPERT;
+    if (budget_experts > max_experts) {
+        fprintf(stderr,
+                "ds4: offload cache budget %u exceeds %u experts in the model; "
+                "clamping to %u\n", budget_experts, max_experts, max_experts);
+        budget_experts = max_experts;
     }
 
     /* Slot layout is uniform across layers; size it from layer 0 and configure. */
@@ -56495,29 +56823,65 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
         if (err) snprintf(err, errlen, "offload populate: cannot size layer-0 experts");
         return -1;
     }
+
+    /* M1: report the planned wired footprint and warn if it crowds physical RAM.
+     * The offload cache is mlock'd, so unlike the mmap backbone it cannot be
+     * reclaimed under pressure — overcommitting drives compressor thrash. */
+    const uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+    const uint64_t planned_bytes = (uint64_t)budget_experts * slot_bytes;
+    const uint64_t phys_ram = glm_graph_host_memory_bytes();
+    fprintf(stderr,
+            "ds4: offload cache plan: %u experts x %.2f MiB = %.2f GiB mlock'd\n",
+            budget_experts, (double)slot_bytes / (1024.0 * 1024.0),
+            (double)planned_bytes / (1024.0 * 1024.0 * 1024.0));
+    if (phys_ram > 0 && planned_bytes > phys_ram - phys_ram / 10ull) {
+        fprintf(stderr,
+                "ds4: WARNING: offload cache (%.2f GiB) exceeds 90%% of physical "
+                "RAM (%.2f GiB); expect paging/OOM. Lower DS4_OFFLOAD_CACHE_EXPERTS.\n",
+                (double)planned_bytes / (1024.0 * 1024.0 * 1024.0),
+                (double)phys_ram / (1024.0 * 1024.0 * 1024.0));
+    }
+
     if (ds4_gpu_offload_cache_configure(gate_expert_bytes, down_expert_bytes,
                                         budget_experts, err, errlen) != 0) {
         return -1;
     }
 
-    uint32_t installed = 0;
-    for (int layer = 0; layer < n_layer && installed < budget_experts; layer++) {
+    /* Precompute per-layer expert geometry so the round-robin fill below stays
+     * simple. All bounds validated up front. */
+    uint64_t l_gbytes[DS4_OFFLOAD_N_LAYER], l_dbytes[DS4_OFFLOAD_N_LAYER];
+    uint64_t l_goff[DS4_OFFLOAD_N_LAYER], l_uoff[DS4_OFFLOAD_N_LAYER];
+    uint64_t l_doff[DS4_OFFLOAD_N_LAYER];
+    for (int layer = 0; layer < n_layer; layer++) {
         const ds4_layer_weights *l = &e->weights.layer[layer];
         if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
             if (err) snprintf(err, errlen,
                               "offload populate: layer %d missing expert tensors", layer);
             return -1;
         }
-        uint64_t g_bytes = 0, d_bytes = 0;
-        if (!streaming_layer_gate_down_expert_bytes(l, &g_bytes, &d_bytes)) {
+        if (!streaming_layer_gate_down_expert_bytes(l, &l_gbytes[layer],
+                                                    &l_dbytes[layer])) {
             if (err) snprintf(err, errlen,
                               "offload populate: cannot size layer %d experts", layer);
             return -1;
         }
-        const uint64_t gate_off = l->ffn_gate_exps->abs_offset;
-        const uint64_t up_off   = l->ffn_up_exps->abs_offset;
-        const uint64_t down_off = l->ffn_down_exps->abs_offset;
-        for (int x = 0; x < (int)DS4_N_EXPERT && installed < budget_experts; x++) {
+        l_goff[layer] = l->ffn_gate_exps->abs_offset;
+        l_uoff[layer] = l->ffn_up_exps->abs_offset;
+        l_doff[layer] = l->ffn_down_exps->abs_offset;
+    }
+
+    /* Install exactly the worker's tier of the hotlist partition — the experts
+     * the coordinator will miss on (is_remote per (layer, expert)). The
+     * coordinator seeds the complementary residency, so their union is the whole
+     * model minus the coldest SSD tail: every coordinator miss the worker holds
+     * is a worker hit (plan §2). A too-small budget just leaves some worker-tier
+     * experts uncached; the worker then replies ERROR and the coordinator falls
+     * back to local compute (still correct, H1/H2). */
+    uint32_t installed = 0;
+    for (int x = 0; x < (int)DS4_N_EXPERT && installed < budget_experts; x++) {
+        for (int layer = 0; layer < n_layer && installed < budget_experts; layer++) {
+            if (!offload_expert_is_remote(layer, x)) continue;   /* not this worker's */
+            const uint64_t g_bytes = l_gbytes[layer], d_bytes = l_dbytes[layer];
             if ((uint64_t)x > UINT64_MAX / g_bytes ||
                 (uint64_t)x > UINT64_MAX / d_bytes) {
                 if (err) snprintf(err, errlen, "offload populate: offset overflow");
@@ -56525,14 +56889,28 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
             }
             const int rc = ds4_gpu_offload_cache_install_expert(
                     layer, x,
-                    gate_off + (uint64_t)x * g_bytes,
-                    up_off   + (uint64_t)x * g_bytes,
-                    down_off + (uint64_t)x * d_bytes,
+                    l_goff[layer] + (uint64_t)x * g_bytes,
+                    l_uoff[layer] + (uint64_t)x * g_bytes,
+                    l_doff[layer] + (uint64_t)x * d_bytes,
                     g_bytes, d_bytes, err, errlen);
             if (rc < 0) return -1;
             if (rc == 0) installed++;
-            else break; /* rc == 1: budget full, stop */
+            /* rc == 1: cache-internal budget full; the loop guard stops us. */
         }
+    }
+
+    /* M2: one prominent warning at the end (not buried mid-scroll) if any slab
+     * failed to lock — a pageable cache silently defeats the whole premise. */
+    const uint64_t unlocked = ds4_gpu_offload_cache_mlock_failed_bytes();
+    if (unlocked > 0) {
+        fprintf(stderr,
+                "ds4: ================================================================\n"
+                "ds4: WARNING: %.2f GiB of the offload cache is NOT mlock'd and may\n"
+                "ds4: be paged to swap under memory pressure -- the critical path\n"
+                "ds4: could then read experts from disk, worse than SSD streaming.\n"
+                "ds4: Raise iogpu.wired_limit_mb (plan §2) and RLIMIT_MEMLOCK.\n"
+                "ds4: ================================================================\n",
+                (double)unlocked / (1024.0 * 1024.0 * 1024.0));
     }
     return (int)installed;
 #endif

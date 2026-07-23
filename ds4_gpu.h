@@ -232,6 +232,9 @@ int ds4_gpu_offload_cache_install_expert(int layer, int expert,
                                          char *err, size_t errlen);
 void ds4_gpu_offload_cache_stats(uint32_t *resident, uint32_t *budget,
                                  uint32_t *slab_count, uint64_t *bytes_allocated);
+/* Total slab bytes that failed to mlock (0 = fully wired). Non-zero means part
+ * of the cache is pageable — the OS may swap experts onto the critical path. */
+uint64_t ds4_gpu_offload_cache_mlock_failed_bytes(void);
 /* Compute the routing-weighted sum of k experts of `layer` on one hidden vector
  * (n_embd f16 -> out_f16), reading the experts from the offload cache slabs via
  * the slots6 IQ2/Q2_K kernels. Regime-independent (no mmap, no streaming cache).

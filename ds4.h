@@ -276,7 +276,17 @@ void ds4_offload_selftest_finalize(ds4_engine *e);
  * local, rest remote). The client pointer is borrowed (owned/closed by the
  * caller), not freed by the engine. */
 void ds4_engine_offload_bind(ds4_engine *e, ds4_offload_client *client);
+/* Seed the coordinator residency bitmap from the expert partition (call after
+ * bind, or standalone for loopback). enable_loopback marks offload active with
+ * no worker so the decode splice can be validated single-process. */
+void ds4_engine_offload_seed_residency(ds4_engine *e);
+void ds4_engine_offload_enable_loopback(ds4_engine *e);
+/* Worker role: auto-size this machine's offload cache to its wired budget and
+ * fix the partition capacities. Call before populate and HELLO on the worker. */
+void ds4_engine_offload_set_worker_role(ds4_engine *e);
 bool ds4_engine_offload_active(const ds4_engine *e);
+/* Identity of the expert partition (for HELLO.partition_hash; both nodes must agree). */
+uint64_t ds4_engine_offload_partition_id(void);
 ds4_offload_client *ds4_engine_offload_client(const ds4_engine *e);
 const ds4_offload_residency *ds4_engine_offload_residency(const ds4_engine *e);
 void ds4_engine_offload_set_residency(ds4_engine *e, const ds4_offload_residency *r);

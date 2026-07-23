@@ -250,6 +250,15 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--tensor-parallel-token-prefill", "GLM diagnostic: prefill one token at a time for exact arithmetic.");
     opt(fp, c, "--debug-hash N", "Cross-check hidden state every N tokens.");
     fputc('\n', fp);
+    title(fp, c, "Expert Offload (DeepSeek-V4-Flash)");
+    fputc('\n', fp);
+    para(fp, c, "Two-machine mode where the whole model lives in combined RAM: a coordinator holds the backbone plus the hottest experts, a worker is a stateless expert-compute server holding the colder experts over Thunderbolt (bridge0, plain TCP). On a coordinator cache miss it ships an 8 KB activation to the worker and gets the expert sum back; weights never cross the wire. Start the worker first, then the coordinator. Set DS4_OFFLOAD_CACHE_EXPERTS on the worker to size its mlock'd expert cache.");
+    fputc('\n', fp);
+    opt(fp, c, "--expert-server", "Run the expert-compute server (worker, e.g. mtwo). Loads the model, then serves EXPERT_REQ frames.");
+    opt(fp, c, "--expert-offload HOST", "Coordinator: dial the worker at HOST and offload routed-expert misses to it.");
+    opt(fp, c, "--expert-offload-bind IP", "Worker bind address (default: all interfaces).");
+    opt(fp, c, "--expert-offload-port N", "TCP port for the offload link. Default: 47300");
+    fputc('\n', fp);
 }
 
 static void print_cli_diagnostics(FILE *fp, const help_colors *c);

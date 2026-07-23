@@ -47,6 +47,14 @@ extern "C" {
 #define DS4_OFFLOAD_DEFAULT_PORT   47300
 #define DS4_OFFLOAD_MAGIC          0x4F464C44u /* "OFLD" */
 
+/* EXPERT_RESP status byte (§8, H1). A worker that cannot compute the requested
+ * experts (GPU error, or — the important case — the expert is not resident in
+ * its cache in the streaming regime where the mmap path is invalid) replies
+ * with DS4_OFFLOAD_STATUS_ERROR instead of a valid-looking zero vector, so the
+ * coordinator never folds silent garbage into the residual. */
+#define DS4_OFFLOAD_STATUS_OK      0u
+#define DS4_OFFLOAD_STATUS_ERROR   1u
+
 /* Wire frame = [ u32 len ][ u8 type ][ payload ] (§8). `len` counts type+payload. */
 typedef enum {
     DS4_OFFLOAD_FRAME_HELLO       = 1,  /* both directions, once, at connect  */
@@ -106,7 +114,8 @@ void ds4_offload_client_close(ds4_offload_client *c);
 
 /* Issue one EXPERT_REQ (§8): compute `expert_ids[k]` weighted by `weights[k]`
  * on `hidden` (n_embd f16), demoting `evict_ids[evict_k]` from the coordinator
- * (piggybacked LRU eviction hint, §6). Non-blocking send; returns the seq to
+ * (piggybacked LRU eviction hint, §6). Blocking send (frames are small and the
+ * socket has a multi-MB send buffer, so this rarely blocks); returns the seq to
  * collect the response by, or 0 on error. */
 uint64_t ds4_offload_client_request(ds4_offload_client *c,
                                     int layer,
@@ -117,8 +126,11 @@ uint64_t ds4_offload_client_request(ds4_offload_client *c,
                                     char *err, size_t errlen);
 
 /* Collect the EXPERT_RESP for `seq` (blocks until it arrives), writing the
- * n_embd f16 weighted sum into `out_f16`. Responses may arrive out of order;
- * the client buffers by seq so per-layer requests can overlap local compute. */
+ * n_embd f16 weighted sum into `out_f16`. Responses are collected strictly
+ * in-order on the single request stream; overlap still works because the
+ * coordinator issues several requests before collecting the first. Returns 0 on
+ * success, -1 on transport error, +1 if the worker replied ERROR (H1). The
+ * latter two are worker-drop signals: `out_f16` is untouched, degrade to solo. */
 int ds4_offload_client_collect(ds4_offload_client *c, uint64_t seq,
                                uint16_t *out_f16, char *err, size_t errlen);
 
