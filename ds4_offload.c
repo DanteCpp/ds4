@@ -923,22 +923,12 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                 continue;
             }
 
-            /* Apply the coordinator's swaps BEFORE computing so a
-             * just-loaded expert is present for this request (the
-             * deferred-swap piggyback can carry a load=Y that is also
-             * in the compute set).  Swap cost is on the critical path
-             * but eliminates the race and the extra network message. */
-            if (swap_k > 0 && opt->evict) {
-                opt->evict(opt->user, layer, swap_evict, swap_load, swap_k);
-                agg.evict_hints += swap_k;
-            }
-
-            /* Critical path: compute the routed experts and reply.
-             * A compute failure (GPU error, or the requested expert not
-             * resident in this worker's cache — the invalid-mmap case,
-             * H1/H2) is reported as an ERROR status, never as a
-             * valid-looking zero vector, so the coordinator never
-             * folds silent garbage into the residual. */
+            /* Critical path: compute the routed experts and reply
+             * FIRST (§5.3).  A compute failure (GPU error, or the
+             * requested expert not resident in this worker's cache —
+             * the invalid-mmap case, H1/H2) is reported as an ERROR
+             * status, never as a valid-looking zero vector, so the
+             * coordinator never folds silent garbage into the residual. */
             const double compute_t0 = off_now_ms();
             const int compute_rc =
                 opt->compute(opt->user, layer, ids, weights, k, hidden, out);
@@ -1002,6 +992,17 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
             if (!off_send_frame(cfd, DS4_OFFLOAD_FRAME_EXPERT_RESP, respbuf,
                                 OFF_RESP_MAX))
                 break;
+
+            /* After the response: apply the coordinator's swaps.
+             * These take effect for the NEXT request to this layer,
+             * so a just-promoted expert that is still in the current
+             * remote set is computed before being evicted.  Deferred
+             * swaps from the ring buffer piggyback here at zero extra
+             * latency. */
+            if (swap_k > 0 && opt->evict) {
+                opt->evict(opt->user, layer, swap_evict, swap_load, swap_k);
+                agg.evict_hints += swap_k;
+            }
         }
 
         off_tok_agg_flush(&agg, opt);
