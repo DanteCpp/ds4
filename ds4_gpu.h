@@ -152,6 +152,10 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void);
  * misses = expert had to be read from SSD. Delta over a layer's local compute
  * attributes that layer's SSD reads (diagnostic; may include readahead noise). */
 void ds4_gpu_stream_expert_cache_hitmiss(uint64_t *hits, uint64_t *misses);
+/* Is (layer, expert) resident in the streaming RAM cache right now? The offload
+ * coordinator uses it to detect, per expert, which local experts will be read
+ * from SSD (not resident) vs served from RAM — the signal that drives swaps. */
+int ds4_gpu_stream_expert_cache_contains(int layer, int expert);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -234,18 +238,19 @@ int ds4_gpu_offload_cache_install_expert(int layer, int expert,
                                          uint64_t gate_expert_bytes,
                                          uint64_t down_expert_bytes,
                                          char *err, size_t errlen);
-/* Phase-2 dynamic swap (plan §6): make (layer, expert) resident, evicting the
- * cache's LRU-coldest expert into its slot (pread from the local GGUF). Called
- * only from the single worker loop thread, after a response is sent (off the
- * critical path). Idempotent. Returns 0 on success, -1 on error (message in
- * err); on error the coordinator self-heals via ERROR-reply -> local fallback. */
-int ds4_gpu_offload_cache_replace_expert(int layer, int expert,
-                                         uint64_t gate_abs_offset,
-                                         uint64_t up_abs_offset,
-                                         uint64_t down_abs_offset,
-                                         uint64_t gate_expert_bytes,
-                                         uint64_t down_expert_bytes,
-                                         char *err, size_t errlen);
+/* Phase-2 dynamic swap (plan §6), coordinator-authoritative: evict EXACTLY
+ * `evict_expert` (which the coordinator knows is resident) and load
+ * `load_expert` into its slot from the local GGUF. The coordinator names both
+ * and mirrors the change, so the two caches never desynchronize. Worker-loop
+ * thread only, after a response and before the next request. Returns 0 on
+ * success, -1 on error (message in err). */
+int ds4_gpu_offload_cache_swap_expert(int layer, int evict_expert, int load_expert,
+                                      uint64_t gate_abs_offset,
+                                      uint64_t up_abs_offset,
+                                      uint64_t down_abs_offset,
+                                      uint64_t gate_expert_bytes,
+                                      uint64_t down_expert_bytes,
+                                      char *err, size_t errlen);
 void ds4_gpu_offload_cache_stats(uint32_t *resident, uint32_t *budget,
                                  uint32_t *slab_count, uint64_t *bytes_allocated);
 /* Phase-2 swap telemetry: cumulative offload-cache hits, misses, and swaps. */

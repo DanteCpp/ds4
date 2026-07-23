@@ -192,16 +192,19 @@ int ds4_offload_client_orchestrate(ds4_offload_client *c,
                                    char *err, size_t errlen);
 
 /* Issue one EXPERT_REQ (§8): compute `expert_ids[k]` weighted by `weights[k]`
- * on `hidden` (n_embd f16), demoting `evict_ids[evict_k]` from the coordinator
- * (piggybacked LRU eviction hint, §6). Blocking send (frames are small and the
- * socket has a multi-MB send buffer, so this rarely blocks); returns the seq to
- * collect the response by, or 0 on error. */
+ * on `hidden` (n_embd f16), and carry `swap_k` coordinator-authoritative cache
+ * swaps — for each, the worker evicts `swap_evict[i]` and loads `swap_load[i]`
+ * (both in `layer`) into its slot (§6). The coordinator names both and mirrors
+ * the change, so the caches never desynchronize. Blocking send (frames are
+ * small and the socket has a multi-MB send buffer, so this rarely blocks);
+ * returns the seq to collect the response by, or 0 on error. */
 uint64_t ds4_offload_client_request(ds4_offload_client *c,
                                     int layer,
                                     const uint16_t *expert_ids,
                                     const float *weights, int k,
                                     const uint16_t *hidden_f16,
-                                    const uint16_t *evict_ids, int evict_k,
+                                    const uint16_t *swap_evict,
+                                    const uint16_t *swap_load, int swap_k,
                                     char *err, size_t errlen);
 
 /* Collect the EXPERT_RESP for `seq` (blocks until it arrives), writing the
@@ -219,8 +222,8 @@ int ds4_offload_client_collect(ds4_offload_client *c, uint64_t seq,
 
 /* Compute the weighted sum of `k` experts of `layer` applied to `hidden`
  * (n_embd f16) into `out` (n_embd f16). Registered by the Metal engine; the
- * worker loop calls it on the critical path, then performs the background
- * evict-load of `evict_ids` (§6) after replying. Returns 0 on success.
+ * worker loop calls it on the critical path, then applies any coordinator swaps
+ * (evict/load pairs, §6) after replying. Returns 0 on success.
  *
  * `user` is the opaque pointer passed to ds4_offload_worker_run. When no Metal
  * backend is registered (e.g. the Phase-0 ping tool), pass the built-in
@@ -232,13 +235,17 @@ typedef int (*ds4_offload_expert_compute_fn)(void *user,
                                              const uint16_t *hidden_f16,
                                              uint16_t *out_f16);
 
-/* Background hook run after the response is sent: page `evict_ids[evict_k]`
- * into the slots just vacated by the promoted experts, from the worker's own
- * SSD copy (§6). May be NULL (Phase 1: static split, no swaps). */
+/* Hook run after the response is sent (and before the next request is read):
+ * apply the coordinator's `swap_k` cache swaps — for each, evict
+ * `swap_evict[i]` and load `swap_load[i]` (both in `layer`) from the worker's
+ * own GGUF into the evicted slot (§6). The coordinator is authoritative over
+ * the worker cache and mirrors the identical change, so the two never
+ * desynchronize. May be NULL (Phase 1: static split, no swaps). */
 typedef void (*ds4_offload_expert_evict_fn)(void *user,
                                             int layer,
-                                            const uint16_t *evict_ids,
-                                            int evict_k);
+                                            const uint16_t *swap_evict,
+                                            const uint16_t *swap_load,
+                                            int swap_k);
 
 /* Orchestration hook (v2): the coordinator's PLAN has arrived — install
  * exactly `plan[count]` into this worker's offload cache and adopt the

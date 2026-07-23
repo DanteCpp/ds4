@@ -10670,6 +10670,17 @@ void ds4_gpu_stream_expert_cache_hitmiss(uint64_t *hits, uint64_t *misses) {
     if (misses) *misses = g_stream_expert_cache_misses;
 }
 
+/* Is (layer, expert) currently resident in the streaming RAM cache? Used by the
+ * offload coordinator to detect, per expert, which locally-computed experts are
+ * about to be read from SSD (not resident) vs served from RAM (resident) — the
+ * exact signal that drives Phase-2 swaps toward the worker. Read-only, O(1). */
+int ds4_gpu_stream_expert_cache_contains(int layer, int expert) {
+    if (layer < 0 || layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        expert < 0 || expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT)
+        return 0;
+    return g_stream_expert_cache[layer][expert].valid ? 1 : 0;
+}
+
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
@@ -11870,60 +11881,50 @@ int ds4_gpu_offload_cache_install_expert(int layer, int expert,
     return 0;
 }
 
-/* Phase-2 dynamic swap (plan §6): make (layer, expert) resident, evicting this
- * cache's LRU-coldest expert to reuse its mlock'd slot. Called by the worker's
- * evict hook AFTER the response is sent (off the critical path) and only from
- * the single worker loop thread, so no GPU command is reading the reused slot
- * concurrently — no lock needed. Idempotent: a already-resident expert is just
- * touched. Returns 0 on success, -1 on error (the caller logs and continues;
- * the coordinator's residency belief self-heals since a subsequent miss on this
- * node replies ERROR -> coordinator local fallback). */
-int ds4_gpu_offload_cache_replace_expert(int layer, int expert,
-                                         uint64_t gate_abs_offset,
-                                         uint64_t up_abs_offset,
-                                         uint64_t down_abs_offset,
-                                         uint64_t gate_expert_bytes,
-                                         uint64_t down_expert_bytes,
-                                         char *err, size_t errlen) {
+/* Phase-2 dynamic swap (plan §6), coordinator-authoritative. Evict EXACTLY
+ * `evict_expert` (which the coordinator knows is resident here) and load
+ * `load_expert` into its freed slot from this node's GGUF. The coordinator
+ * names both, mirrors the identical change in its residency bitmap, and never
+ * lets the worker choose a victim — so the two sides can never desynchronize.
+ * Called only from the single worker loop thread, after a response is sent and
+ * before the next request is read, so (a) no GPU command is reading the reused
+ * slot and (b) the loaded expert is guaranteed present before it can next be
+ * requested. Returns 0 on success, -1 on error (message in err). */
+int ds4_gpu_offload_cache_swap_expert(int layer, int evict_expert, int load_expert,
+                                      uint64_t gate_abs_offset,
+                                      uint64_t up_abs_offset,
+                                      uint64_t down_abs_offset,
+                                      uint64_t gate_expert_bytes,
+                                      uint64_t down_expert_bytes,
+                                      char *err, size_t errlen) {
     if (!g_offload_expert_cache_active) {
         if (err) snprintf(err, errlen, "offload cache: not configured");
         return -1;
     }
     if (layer < 0 || layer >= DS4_OFFLOAD_N_LAYER ||
-        expert < 0 || expert >= DS4_OFFLOAD_N_ROUTED) {
+        evict_expert < 0 || evict_expert >= DS4_OFFLOAD_N_ROUTED ||
+        load_expert < 0 || load_expert >= DS4_OFFLOAD_N_ROUTED) {
         if (err) snprintf(err, errlen, "offload cache: layer/expert out of range");
         return -1;
     }
-    ds4_gpu_offload_expert_entry *tgt = &g_offload_expert_cache[layer][expert];
-    if (tgt->valid) {                       /* already here: promote in LRU */
+    ds4_gpu_offload_expert_entry *tgt = &g_offload_expert_cache[layer][load_expert];
+    if (tgt->valid) {                    /* already resident: just promote in LRU */
         tgt->last_used = ++g_offload_expert_cache_clock;
         return 0;
     }
-    /* If the budget is not yet full (warm-up), a plain install is cheaper than
-     * an eviction and keeps occupancy climbing to the negotiated capacity. */
-    if (g_offload_expert_cache_resident < g_offload_expert_cache_budget) {
-        return ds4_gpu_offload_cache_install_expert(
-                layer, expert, gate_abs_offset, up_abs_offset, down_abs_offset,
-                gate_expert_bytes, down_expert_bytes, err, errlen);
-    }
-
-    /* Find the LRU-coldest resident expert to evict; reuse its slot. */
-    ds4_gpu_offload_expert_entry *victim = NULL;
-    uint64_t oldest = UINT64_MAX;
-    for (int l = 0; l < DS4_OFFLOAD_N_LAYER; l++) {
-        for (int x = 0; x < DS4_OFFLOAD_N_ROUTED; x++) {
-            ds4_gpu_offload_expert_entry *e = &g_offload_expert_cache[l][x];
-            if (e->valid && e->last_used < oldest) { oldest = e->last_used; victim = e; }
-        }
-    }
-    if (!victim) {
-        if (err) snprintf(err, errlen, "offload cache: no victim to evict");
+    ds4_gpu_offload_expert_entry *victim = &g_offload_expert_cache[layer][evict_expert];
+    if (!victim->valid) {
+        /* The coordinator believes this slot holds `evict_expert` but it does
+         * not. That is a sync violation (must never happen); refuse rather than
+         * evict something the coordinator is not tracking. */
+        if (err) snprintf(err, errlen,
+                          "offload cache: evict target L%d E%d not resident (desync)",
+                          layer, evict_expert);
         return -1;
     }
 
     /* Validate the incoming expert's byte geometry matches the slot layout
-     * before we overwrite the victim (so a bad request cannot corrupt a good
-     * slot). */
+     * before overwriting the victim (a bad request cannot corrupt a good slot). */
     uint64_t want = gate_expert_bytes * 2ull + down_expert_bytes;
     const uint64_t page = (uint64_t)getpagesize();
     if (page != 0) want = round_up_u64(want, page);
@@ -11951,18 +11952,18 @@ int ds4_gpu_offload_cache_replace_expert(int layer, int expert,
                                           contents + up_inner, &rb, &ms) ||
         !ds4_gpu_stream_expert_pread_into(down_abs_offset, down_expert_bytes,
                                           contents + down_inner, &rb, &ms)) {
-        /* pread failed: the victim slot is now partially overwritten and no
-         * longer holds a valid expert. Invalidate it (its next request replies
-         * ERROR -> coordinator local fallback) rather than serve garbage. */
+        /* pread failed: the slot is now partially overwritten. Invalidate it so
+         * a later request for either expert replies ERROR (coordinator falls
+         * back to local) instead of serving garbage. */
         victim->valid = 0;
         g_offload_expert_cache_resident--;
         if (err) snprintf(err, errlen,
-                          "offload cache: pread failed swapping in L%d E%d",
-                          layer, expert);
+                          "offload cache: pread failed swapping L%d E%d<-E%d",
+                          layer, evict_expert, load_expert);
         return -1;
     }
 
-    victim->valid = 0;                              /* vacate the victim entry   */
+    if (tgt != victim) victim->valid = 0;          /* vacate the evicted entry  */
     tgt->gate_buffer = slab;
     tgt->up_buffer   = slab;
     tgt->down_buffer = slab;

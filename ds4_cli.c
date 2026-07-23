@@ -145,21 +145,22 @@ static void cli_offload_diag(void *user, char *buf, size_t buflen) {
     ds4_engine_offload_cache_diag((ds4_engine *)user, buf, buflen);
 }
 
-/* Phase-2 dynamic swap (plan §6): the coordinator piggybacked demoted experts
- * as evict hints; page each into this worker's mlock'd cache (evicting the
- * cache's LRU-coldest to reuse its slot). Runs AFTER the response is sent, so
- * off the critical path. A failure is non-fatal: the coordinator self-heals
- * because a later miss on this expert replies ERROR -> coordinator local
- * fallback (H1). */
+/* Phase-2 dynamic swap (plan §6), coordinator-authoritative: for each swap the
+ * coordinator named both the expert to evict and the expert to load; apply them
+ * exactly so this worker's cache stays identical to the coordinator's residency
+ * belief. Runs after the response is sent, before the next request is read. A
+ * failure is logged (to file/CLI) but non-fatal — a later miss on that expert
+ * replies ERROR -> coordinator local fallback (H1). */
 static void cli_offload_evict(void *user, int layer,
-                              const uint16_t *evict_ids, int evict_k) {
+                              const uint16_t *swap_evict,
+                              const uint16_t *swap_load, int swap_k) {
     ds4_engine *engine = (ds4_engine *)user;
-    for (int i = 0; i < evict_k; i++) {
+    for (int i = 0; i < swap_k; i++) {
         char err[160] = "";
-        if (ds4_engine_offload_cache_replace(engine, layer, (int)evict_ids[i],
-                                             err, sizeof(err)) != 0)
-            fprintf(stderr, "ds4: expert-server: swap-in L%d E%u failed: %s\n",
-                    layer, evict_ids[i], err);
+        if (ds4_engine_offload_cache_swap(engine, layer, (int)swap_evict[i],
+                                          (int)swap_load[i], err, sizeof(err)) != 0)
+            fprintf(stderr, "ds4: expert-server: swap L%d E%u<-E%u failed: %s\n",
+                    layer, swap_evict[i], swap_load[i], err);
     }
 }
 

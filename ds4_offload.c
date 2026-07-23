@@ -80,8 +80,12 @@ static void off_logv(ds4_offload_log *l, int also_stderr,
 }
 
 void ds4_offload_logf(ds4_offload_log *l, const char *fmt, ...) {
+    /* File-only: when a session log is enabled the per-token / lifecycle lines
+     * belong in the file, not the interactive CLI (the user reads the file
+     * post-hoc). Direct fprintf(stderr) lifecycle notices elsewhere are
+     * unaffected; this only silences the timestamped log stream. */
     va_list ap; va_start(ap, fmt);
-    off_logv(l, 1, fmt, ap);
+    off_logv(l, 0, fmt, ap);
     va_end(ap);
 }
 
@@ -387,12 +391,18 @@ static uint32_t off_pack_plan_ack(unsigned char *out, uint32_t status,
 /* ------------------------------------------------------------------------
  * EXPERT_REQ / EXPERT_RESP payload (de)serialization (§8).
  *   REQ:  layer u16, seq u64, k u8, ids[k] u16, weights[k] f32,
- *         hidden[n_embd] f16, evict_k u8, evict_ids[evict_k] u16
- *   RESP: seq u64, y[n_embd] f16
+ *         hidden[n_embd] f16, swap_k u8, (evict u16, load u16)[swap_k]
+ *   RESP: seq u64, status u8, y[n_embd] f16
+ *
+ * Phase-2 swap (plan §6): each swap entry names BOTH the expert to evict from
+ * the worker cache and the expert to load into its slot — the coordinator is
+ * authoritative over the worker's contents, so it dictates the exact victim
+ * rather than letting the worker choose (which would desynchronize the two
+ * sides). Both experts belong to `layer`.
  * --------------------------------------------------------------------- */
 
-/* Max REQ payload: 2 + 8 + 1 + k*2 + k*4 + 8192 + 1 + k*2 with k<=N_USED. */
-#define OFF_REQ_MAX (2 + 8 + 1 + DS4_OFFLOAD_N_USED * 8 + \
+/* Max REQ payload: 2+8+1 + k*(2 ids + 4 w) + hidden + 1 + k*(2+2 swap pair). */
+#define OFF_REQ_MAX (2 + 8 + 1 + DS4_OFFLOAD_N_USED * 10 + \
                      (int)DS4_OFFLOAD_HIDDEN_F16_BYTES + 1)
 /* RESP: seq u64, status u8, y[n_embd] f16 (§8, H1). */
 #define OFF_RESP_MAX (8 + 1 + (int)DS4_OFFLOAD_HIDDEN_F16_BYTES)
@@ -400,7 +410,8 @@ static uint32_t off_pack_plan_ack(unsigned char *out, uint32_t status,
 static uint32_t off_pack_req(unsigned char *out, int layer, uint64_t seq,
                              const uint16_t *ids, const float *weights, int k,
                              const uint16_t *hidden_f16,
-                             const uint16_t *evict_ids, int evict_k) {
+                             const uint16_t *swap_evict,
+                             const uint16_t *swap_load, int swap_k) {
     unsigned char *p = out;
     uint16_t l16 = (uint16_t)layer;
     memcpy(p, &l16, 2); p += 2;
@@ -410,8 +421,11 @@ static uint32_t off_pack_req(unsigned char *out, int layer, uint64_t seq,
     memcpy(p, weights, (size_t)k * 4); p += (size_t)k * 4;
     memcpy(p, hidden_f16, DS4_OFFLOAD_HIDDEN_F16_BYTES);
     p += DS4_OFFLOAD_HIDDEN_F16_BYTES;
-    *p++ = (uint8_t)evict_k;
-    memcpy(p, evict_ids, (size_t)evict_k * 2); p += (size_t)evict_k * 2;
+    *p++ = (uint8_t)swap_k;
+    for (int i = 0; i < swap_k; i++) {
+        memcpy(p, &swap_evict[i], 2); p += 2;
+        memcpy(p, &swap_load[i], 2);  p += 2;
+    }
     return (uint32_t)(p - out);
 }
 
@@ -420,7 +434,7 @@ static int off_unpack_req(const unsigned char *in, uint32_t bytes,
                           int *layer, uint64_t *seq,
                           uint16_t *ids, float *weights, int *k,
                           uint16_t *hidden_f16,
-                          uint16_t *evict_ids, int *evict_k) {
+                          uint16_t *swap_evict, uint16_t *swap_load, int *swap_k) {
     const unsigned char *p = in;
     const unsigned char *end = in + bytes;
     if (end - p < 2 + 8 + 1) return -1;
@@ -435,13 +449,16 @@ static int off_unpack_req(const unsigned char *in, uint32_t bytes,
     memcpy(weights, p, (size_t)kk * 4); p += (size_t)kk * 4;
     memcpy(hidden_f16, p, DS4_OFFLOAD_HIDDEN_F16_BYTES);
     p += DS4_OFFLOAD_HIDDEN_F16_BYTES;
-    uint8_t ek = *p++;
-    if (ek > DS4_OFFLOAD_N_USED) return -1;
-    if ((size_t)(end - p) < (size_t)ek * 2) return -1;
-    memcpy(evict_ids, p, (size_t)ek * 2);
+    uint8_t sk = *p++;
+    if (sk > DS4_OFFLOAD_N_USED) return -1;
+    if ((size_t)(end - p) < (size_t)sk * 4) return -1;
+    for (int i = 0; i < sk; i++) {
+        memcpy(&swap_evict[i], p, 2); p += 2;
+        memcpy(&swap_load[i],  p, 2); p += 2;
+    }
     *layer = l16;
     *k = kk;
-    *evict_k = ek;
+    *swap_k = sk;
     return 0;
 }
 
@@ -567,10 +584,11 @@ uint64_t ds4_offload_client_request(ds4_offload_client *c, int layer,
                                     const uint16_t *expert_ids,
                                     const float *weights, int k,
                                     const uint16_t *hidden_f16,
-                                    const uint16_t *evict_ids, int evict_k,
+                                    const uint16_t *swap_evict,
+                                    const uint16_t *swap_load, int swap_k,
                                     char *err, size_t errlen) {
-    if (!c || k < 0 || k > DS4_OFFLOAD_N_USED || evict_k < 0 ||
-        evict_k > DS4_OFFLOAD_N_USED) {
+    if (!c || k < 0 || k > DS4_OFFLOAD_N_USED || swap_k < 0 ||
+        swap_k > DS4_OFFLOAD_N_USED) {
         off_set_err(err, errlen, "offload request: bad arguments");
         return 0;
     }
@@ -578,7 +596,7 @@ uint64_t ds4_offload_client_request(ds4_offload_client *c, int layer,
     pthread_mutex_lock(&c->lock);
     uint64_t seq = c->next_seq++;
     uint32_t n = off_pack_req(req, layer, seq, expert_ids, weights, k,
-                              hidden_f16, evict_ids, evict_k);
+                              hidden_f16, swap_evict, swap_load, swap_k);
     int ok = off_send_frame(c->fd, DS4_OFFLOAD_FRAME_EXPERT_REQ, req, n);
     pthread_mutex_unlock(&c->lock);
     if (!ok) {
@@ -878,7 +896,8 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
         uint16_t *out = malloc(DS4_OFFLOAD_HIDDEN_F16_BYTES);
         uint16_t ids[DS4_OFFLOAD_N_USED];
         float weights[DS4_OFFLOAD_N_USED];
-        uint16_t evict_ids[DS4_OFFLOAD_N_USED];
+        uint16_t swap_evict[DS4_OFFLOAD_N_USED];
+        uint16_t swap_load[DS4_OFFLOAD_N_USED];
         if (!reqbuf || !respbuf || !hidden || !out) {
             off_set_err(err, errlen, "offload worker: out of memory");
             free(reqbuf); free(respbuf); free(hidden); free(out);
@@ -896,10 +915,10 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
             if (type == DS4_OFFLOAD_FRAME_BYE) break;
             if (type != DS4_OFFLOAD_FRAME_EXPERT_REQ) continue;
 
-            int layer = 0, k = 0, evict_k = 0;
+            int layer = 0, k = 0, swap_k = 0;
             uint64_t seq = 0;
             if (off_unpack_req(reqbuf, bytes, &layer, &seq, ids, weights, &k,
-                               hidden, evict_ids, &evict_k) != 0) {
+                               hidden, swap_evict, swap_load, &swap_k) != 0) {
                 fprintf(stderr, "ds4-offload: malformed EXPERT_REQ, dropping\n");
                 continue;
             }
@@ -973,11 +992,14 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                                 OFF_RESP_MAX))
                 break;
 
-            /* Background, after the response: page the evicted experts in from
-             * this worker's own SSD copy (§6). Weights never cross the wire. */
-            if (evict_k > 0 && opt->evict) {
-                opt->evict(opt->user, layer, evict_ids, evict_k);
-                agg.evict_hints += evict_k;
+            /* After the response (and before the next request is read, so the
+             * loaded expert is guaranteed present when next requested): apply
+             * the coordinator's swaps — evict exactly swap_evict[i], load
+             * swap_load[i] from this worker's own GGUF. Weights never cross the
+             * wire; the coordinator mirrors the identical change (§6). */
+            if (swap_k > 0 && opt->evict) {
+                opt->evict(opt->user, layer, swap_evict, swap_load, swap_k);
+                agg.evict_hints += swap_k;
             }
         }
 

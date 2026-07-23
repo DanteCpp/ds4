@@ -308,12 +308,14 @@ int ds4_engine_offload_apply_plan(ds4_engine *e, uint32_t coord_cap,
                                   uint32_t *installed, uint64_t *wired_bytes,
                                   char *err, size_t errlen);
 bool ds4_engine_offload_active(const ds4_engine *e);
-/* Phase-2 dynamic swap (plan §6): the worker's evict hook — page (layer,expert)
- * into the offload cache (evicting its LRU-coldest) from this node's own GGUF.
- * Resolves the expert's tensor offsets from the loaded model, then calls the
- * Metal cache. Returns 0 on success, -1 on error (message in err). */
-int ds4_engine_offload_cache_replace(ds4_engine *e, int layer, int expert,
-                                     char *err, size_t errlen);
+/* Phase-2 dynamic swap (plan §6), coordinator-authoritative: the worker's evict
+ * hook — in `layer`, evict exactly `evict_expert` from the offload cache and
+ * load `load_expert` into its slot from this node's own GGUF. Resolves the
+ * loaded expert's tensor offsets from the model, then calls the Metal cache.
+ * Returns 0 on success, -1 on error (message in err). */
+int ds4_engine_offload_cache_swap(ds4_engine *e, int layer,
+                                  int evict_expert, int load_expert,
+                                  char *err, size_t errlen);
 /* Identity of the expert partition (for HELLO.partition_hash; both nodes must agree). */
 uint64_t ds4_engine_offload_partition_id(void);
 ds4_offload_client *ds4_engine_offload_client(const ds4_engine *e);

@@ -21558,51 +21558,67 @@ static void offload_f16_to_f32(const uint16_t *in, float *out, uint32_t n) {
  * single-process loopback used to validate the splice arithmetic here on mone,
  * which reads the local offload cache the same way the worker does).
  * Returns 0 on success (out16 = f16 partial), non-zero to trigger local fallback. */
+static void offload_commit_swaps(ds4_engine *e, int layer,
+                                 const uint16_t *swap_evict,
+                                 const uint16_t *swap_load, int swap_k);
+
 static int offload_fetch_remote_partial(ds4_engine *e, int layer,
                                         const uint16_t *ids, const float *w, int k,
                                         const uint16_t *hidden_f16, uint16_t *out16,
-                                        const uint16_t *evict_ids, int evict_k) {
+                                        const uint16_t *swap_evict,
+                                        const uint16_t *swap_load, int swap_k) {
     ds4_offload_client *c = ds4_engine_offload_client(e);
     if (c) {
         char err[160] = "";
         uint64_t seq = ds4_offload_client_request(c, layer, ids, w, k, hidden_f16,
-                                                  evict_ids, evict_k, err, sizeof(err));
+                                                  swap_evict, swap_load, swap_k,
+                                                  err, sizeof(err));
         if (seq == 0) { fprintf(stderr, "ds4: offload request L%d: %s\n", layer, err); return -1; }
+        /* Send succeeded: the worker (TCP) will receive and apply the swaps, so
+         * mirror them into our residency belief now — the two stay in lock-step
+         * even if the response is lost below. */
+        offload_commit_swaps(e, layer, swap_evict, swap_load, swap_k);
         int rc = ds4_offload_client_collect(c, seq, out16, err, sizeof(err));
         if (rc != 0) { fprintf(stderr, "ds4: offload collect L%d: %s\n", layer, err); return -1; }
         return 0;
     }
     /* Loopback (no worker): compute the "remote" partial through this process's
-     * own offload cache, and apply the swap locally so the mechanism is
+     * own offload cache, and apply the swaps locally so the mechanism is
      * exercised on-box (mone) exactly as the worker would. */
     int rc = ds4_engine_offload_compute_experts(e, layer, ids, w, k, hidden_f16, out16);
-    for (int i = 0; i < evict_k; i++) {
+    for (int i = 0; i < swap_k; i++) {
         char err[160] = "";
-        if (ds4_engine_offload_cache_replace(e, layer, (int)evict_ids[i], err, sizeof(err)) != 0 &&
+        if (ds4_engine_offload_cache_swap(e, layer, (int)swap_evict[i],
+                                          (int)swap_load[i], err, sizeof(err)) != 0 &&
             getenv("DS4_OFFLOAD_DEBUG"))
-            fprintf(stderr, "ds4: loopback evict L%d E%u: %s\n", layer, evict_ids[i], err);
+            fprintf(stderr, "ds4: loopback swap L%d E%u<-E%u: %s\n",
+                    layer, swap_evict[i], swap_load[i], err);
     }
+    offload_commit_swaps(e, layer, swap_evict, swap_load, swap_k);
     return rc;
 }
 
-/* Plan one dynamic swap for a fired layer (plan §6). Touches the recency of the
- * selected experts, then — if a REMOTE expert is being hit for the 2nd+ time
- * (genuinely recurring, not a one-off) and a colder resident local expert can
- * be spared — promotes the remote expert to local and demotes the local victim
- * to the worker, returning the victim in `evict_out` so the caller ships it as
- * the EXPERT_REQ evict hint. At most one swap per layer bounds cache churn.
- * `sel_ids` are the k selected expert ids; `remote_idx` indexes the remote
- * subset. Returns the number of evict hints written (0 or 1). */
+/* Plan one coordinator-authoritative cache swap for a fired layer (plan §6).
+ * First touch the recency of every selected expert. Then, to convert a recurring
+ * SSD read into an offload: find a selected LOCAL expert Z that is being read
+ * from SSD right now (not resident in the streaming RAM cache) and has been seen
+ * before, and move it onto the worker — evicting the worker's LRU-coldest expert
+ * of this layer that is not selected now. The coordinator names BOTH sides of
+ * the swap (evict E, load Z) and mirrors the identical change in its residency
+ * bitmap, so its belief and the worker cache stay perfectly in sync. At most one
+ * swap per layer bounds churn. Returns the number of swaps written (0 or 1);
+ * fills swap_evict[0]/swap_load[0] when 1. */
 static int offload_plan_swap(ds4_engine *e, int layer,
                              const uint16_t *sel_ids, int k,
-                             const uint8_t *remote_idx, int n_remote,
-                             uint16_t *evict_out) {
+                             const uint8_t *local_idx, int n_local,
+                             int can_swap,
+                             uint16_t *swap_evict, uint16_t *swap_load) {
     if (!g_offload_swap_checked) {
         g_offload_swap_disabled = getenv("DS4_OFFLOAD_NO_SWAP") != NULL;
         g_offload_swap_checked = true;
     }
-    /* Bump recency for every selected expert first (both local and remote), so a
-     * freshly-promoted victim search never targets an expert in active use. */
+    /* Bump recency for every selected expert first, so the victim search below
+     * never targets an expert in active use this layer. */
     const uint64_t tick = ++g_offload_swap_clock;
     uint64_t prev_lu[DS4_OFFLOAD_N_USED];
     for (int i = 0; i < k; i++) {
@@ -21614,41 +21630,68 @@ static int offload_plan_swap(ds4_engine *e, int layer,
             prev_lu[i] = tick;
         }
     }
-    if (g_offload_swap_disabled || n_remote == 0) return 0;
+    /* Swaps ride on an EXPERT_REQ, so only plan one when this layer already
+     * fires a worker request (can_swap); all-local layers still update recency
+     * above but defer any swap to a layer that has wire traffic. */
+    if (g_offload_swap_disabled || !can_swap) return 0;
 
-    /* Promotion candidate: a remote expert hit before (prev recency non-zero),
-     * i.e. recurring in this conversation and worth pulling into the fast tier. */
-    int promote = -1;
-    for (int i = 0; i < n_remote; i++) {
-        const int pos = (int)remote_idx[i];
-        if (pos >= 0 && pos < k && prev_lu[pos] != 0) { promote = (int)sel_ids[pos]; break; }
+    /* Load candidate Z: a selected LOCAL expert, seen before (recurring, not a
+     * one-off), that is NOT resident in the streaming RAM cache — i.e. this
+     * layer just paid (or is about to pay) an SSD read for it. Moving Z to the
+     * worker makes its next hit an ~2 ms offload instead of an SSD read. */
+    int load_z = -1;
+    for (int i = 0; i < n_local; i++) {
+        const int pos = (int)local_idx[i];
+        if (pos < 0 || pos >= k) continue;
+        const int z = (int)sel_ids[pos];
+        if (z < 0 || z >= DS4_OFFLOAD_N_ROUTED) continue;
+        if (prev_lu[pos] == 0) continue;                 /* first sighting: skip */
+        if (ds4_gpu_stream_expert_cache_contains(layer, z)) continue; /* in RAM  */
+        load_z = z; break;
     }
-    if (promote < 0) return 0;
+    if (load_z < 0) return 0;
 
-    /* Victim: the LRU-coldest resident (local) expert of this layer that is not
-     * selected right now. Scanning the 256 experts is trivial and infrequent.
-     * (The full ds4_engine struct is defined later in this file, so reach the
-     * bitmap through the accessor; the cast drops const on the same object.) */
+    /* Evict target E: the LRU-coldest WORKER expert (residency == remote) of this
+     * layer that is not selected now. The full ds4_engine struct is defined later
+     * in this file, so reach the bitmap through the accessor (same object). */
     ds4_offload_residency *res =
         (ds4_offload_residency *)ds4_engine_offload_residency(e);
     if (!res) return 0;
-    int victim = -1; uint64_t oldest = UINT64_MAX;
+    int evict_e = -1; uint64_t oldest = UINT64_MAX;
     for (int x = 0; x < DS4_OFFLOAD_N_ROUTED; x++) {
-        if (!ds4_offload_residency_get(res, layer, x)) continue;   /* already remote */
+        if (ds4_offload_residency_get(res, layer, x)) continue;   /* local, not on worker */
         bool selected = false;
         for (int i = 0; i < k; i++) if ((int)sel_ids[i] == x) { selected = true; break; }
-        if (selected) continue;
-        if (g_offload_lu[layer][x] < oldest) { oldest = g_offload_lu[layer][x]; victim = x; }
+        if (selected) continue;                    /* in use this layer: keep it */
+        if (g_offload_lu[layer][x] < oldest) { oldest = g_offload_lu[layer][x]; evict_e = x; }
     }
-    if (victim < 0) return 0;
+    if (evict_e < 0) return 0;                      /* no spare worker slot in layer */
 
-    /* Commit the swap for the NEXT token: promote local, demote to worker. The
-     * demoted victim rides out as the evict hint so the worker loads it now. */
-    ds4_offload_residency_set(res, layer, promote, true);   /* remote -> local  */
-    ds4_offload_residency_set(res, layer, victim, false);   /* local  -> worker */
-    evict_out[0] = (uint16_t)victim;
-    g_offload_coord_swaps++;
+    /* Decide the swap but DO NOT mirror residency yet: the coordinator must only
+     * update its belief once it knows the worker received the frame (a failed
+     * send would otherwise leave the two permanently out of sync). The commit
+     * happens in offload_commit_swaps() after a successful send. */
+    swap_evict[0] = (uint16_t)evict_e;
+    swap_load[0]  = (uint16_t)load_z;
     return 1;
+}
+
+/* Mirror the just-sent swaps into the coordinator's residency belief: Z (loaded
+ * onto the worker) becomes remote, E (evicted from the worker) becomes local.
+ * Called ONLY after the EXPERT_REQ carrying them was sent successfully, so the
+ * worker is guaranteed (TCP) to receive and apply the identical change — the two
+ * caches stay in lock-step. */
+static void offload_commit_swaps(ds4_engine *e, int layer,
+                                 const uint16_t *swap_evict,
+                                 const uint16_t *swap_load, int swap_k) {
+    ds4_offload_residency *res =
+        (ds4_offload_residency *)ds4_engine_offload_residency(e);
+    if (!res) return;
+    for (int i = 0; i < swap_k; i++) {
+        ds4_offload_residency_set(res, layer, (int)swap_load[i], false);  /* -> worker */
+        ds4_offload_residency_set(res, layer, (int)swap_evict[i], true);  /* -> local  */
+        g_offload_coord_swaps++;
+    }
 }
 
 /* Coordinator session log: per-layer serving origin and per-token summaries.
@@ -21781,13 +21824,14 @@ static int metal_graph_routed_moe_or_offload(
                                 ids16, (int)n_expert, local_idx, &n_local,
                                 remote_idx, &n_remote);
 
-    /* Phase-2: touch recency and plan at most one promote/demote swap for this
-     * layer. Returns the demoted victim to ship as the worker evict hint. The
-     * residency change takes effect from the next token; this token still uses
-     * the split just computed. */
-    uint16_t evict_ids[DS4_OFFLOAD_N_USED];
-    int evict_k = offload_plan_swap(e, (int)layer_index, ids16, (int)n_expert,
-                                    remote_idx, n_remote, evict_ids);
+    /* Phase-2: touch recency and, when this layer fires a worker request, plan
+     * at most one coordinator-authoritative swap (evict E from the worker, load
+     * an SSD-missing local expert Z onto it). The residency change takes effect
+     * next token; this token still uses the split just computed. */
+    uint16_t swap_evict[DS4_OFFLOAD_N_USED], swap_load[DS4_OFFLOAD_N_USED];
+    int swap_k = offload_plan_swap(e, (int)layer_index, ids16, (int)n_expert,
+                                   local_idx, n_local, n_remote > 0,
+                                   swap_evict, swap_load);
 
     if (n_remote == 0) {          /* all experts resident: plain local compute */
         if (ds4_gpu_begin_commands() == 0) return 0;
@@ -21819,7 +21863,7 @@ static int metal_graph_routed_moe_or_offload(
     const int fetch_rc = offload_fetch_remote_partial(e, (int)layer_index,
                                                       rids, rw, n_remote,
                                                       hidden16, partial16,
-                                                      evict_ids, evict_k);
+                                                      swap_evict, swap_load, swap_k);
     const double net_ms = olog ? (now_sec() - net_t0) * 1000.0 : 0.0;
     if (fetch_rc != 0) {
         /* Worker drop / error: full local compute is still correct (§Phase-3). */
@@ -57350,41 +57394,44 @@ int ds4_engine_offload_apply_plan(ds4_engine *e, uint32_t coord_cap,
 #endif
 }
 
-int ds4_engine_offload_cache_replace(ds4_engine *e, int layer, int expert,
-                                     char *err, size_t errlen) {
+int ds4_engine_offload_cache_swap(ds4_engine *e, int layer,
+                                  int evict_expert, int load_expert,
+                                  char *err, size_t errlen) {
 #if defined(DS4_NO_GPU) || !defined(__APPLE__)
-    (void)e; (void)layer; (void)expert;
+    (void)e; (void)layer; (void)evict_expert; (void)load_expert;
     if (err) snprintf(err, errlen, "offload cache requires the Metal backend");
     return -1;
 #else
-    if (!e) { if (err) snprintf(err, errlen, "offload replace: null engine"); return -1; }
+    if (!e) { if (err) snprintf(err, errlen, "offload swap: null engine"); return -1; }
     const int n_layer = ds4_engine_layer_count(e);
     if (layer < 0 || layer >= n_layer || layer >= DS4_OFFLOAD_N_LAYER ||
-        expert < 0 || expert >= (int)DS4_N_EXPERT) {
-        if (err) snprintf(err, errlen, "offload replace: bad ref L%d E%d", layer, expert);
+        evict_expert < 0 || evict_expert >= (int)DS4_N_EXPERT ||
+        load_expert < 0 || load_expert >= (int)DS4_N_EXPERT) {
+        if (err) snprintf(err, errlen, "offload swap: bad ref L%d E%d<-E%d",
+                          layer, evict_expert, load_expert);
         return -1;
     }
     const ds4_layer_weights *l = &e->weights.layer[layer];
     if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
-        if (err) snprintf(err, errlen, "offload replace: layer %d missing experts", layer);
+        if (err) snprintf(err, errlen, "offload swap: layer %d missing experts", layer);
         return -1;
     }
     uint64_t g_bytes = 0, d_bytes = 0;
     if (!streaming_layer_gate_down_expert_bytes(l, &g_bytes, &d_bytes) ||
         g_bytes == 0 || d_bytes == 0) {
-        if (err) snprintf(err, errlen, "offload replace: cannot size layer %d", layer);
+        if (err) snprintf(err, errlen, "offload swap: cannot size layer %d", layer);
         return -1;
     }
-    if ((uint64_t)expert > UINT64_MAX / g_bytes ||
-        (uint64_t)expert > UINT64_MAX / d_bytes) {
-        if (err) snprintf(err, errlen, "offload replace: offset overflow");
+    if ((uint64_t)load_expert > UINT64_MAX / g_bytes ||
+        (uint64_t)load_expert > UINT64_MAX / d_bytes) {
+        if (err) snprintf(err, errlen, "offload swap: offset overflow");
         return -1;
     }
-    return ds4_gpu_offload_cache_replace_expert(
-            layer, expert,
-            l->ffn_gate_exps->abs_offset + (uint64_t)expert * g_bytes,
-            l->ffn_up_exps->abs_offset   + (uint64_t)expert * g_bytes,
-            l->ffn_down_exps->abs_offset + (uint64_t)expert * d_bytes,
+    return ds4_gpu_offload_cache_swap_expert(
+            layer, evict_expert, load_expert,
+            l->ffn_gate_exps->abs_offset + (uint64_t)load_expert * g_bytes,
+            l->ffn_up_exps->abs_offset   + (uint64_t)load_expert * g_bytes,
+            l->ffn_down_exps->abs_offset + (uint64_t)load_expert * d_bytes,
             g_bytes, d_bytes, err, errlen);
 #endif
 }
