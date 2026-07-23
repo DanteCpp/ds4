@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu.h"
 #include "ds4_gpu_args.h"
 #include "ds4_offload.h"
 #include "ds4_tp.h"
@@ -2250,6 +2251,14 @@ int main(int argc, char **argv) {
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    if (cfg.offload.worker) {
+        /* The expert-server serves only its assigned expert subset from the
+         * mlock'd offload cache (which carries its own residency set); it never
+         * needs the full 80+ GB model Metal-resident. Requesting full-model
+         * residency + warmup over-commits and OOMs on any machine smaller than
+         * the model. Skip it here so the model views fault lazily. */
+        ds4_gpu_model_residency_skip(1);
+    }
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
