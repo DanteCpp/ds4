@@ -35611,6 +35611,7 @@ struct ds4_engine {
 };
 
 static uint64_t glm_graph_wired_limit_bytes(void);   /* fwd: defined below */
+static uint64_t glm_graph_host_memory_bytes(void);   /* fwd: defined below */
 
 /* Max experts fitting `budget_bytes` at this model's per-expert size. */
 static uint32_t offload_experts_for_bytes(ds4_engine *e, uint64_t budget_bytes) {
@@ -35645,7 +35646,13 @@ static void offload_compute_capacities(ds4_engine *e, bool self_is_worker) {
     /* Reserve headroom over the mlock'd expert cache for the OS, the mmap'd
      * backbone working set, and transient staging. */
     const uint64_t reserve = 6ull * 1024 * 1024 * 1024;
-    const uint64_t wired = glm_graph_wired_limit_bytes();
+    uint64_t wired = glm_graph_wired_limit_bytes();
+    if (wired == 0) {
+        /* iogpu.wired_limit_mb not raised: fall back to macOS's default wired
+         * ceiling (~2/3 of physical RAM) so auto-sizing still works. */
+        const uint64_t ram = glm_graph_host_memory_bytes();
+        wired = ram - ram / 3ull;
+    }
     const uint64_t budget = wired > reserve ? wired - reserve : 0;
     const uint32_t automax = offload_experts_for_bytes(e, budget);
 
@@ -35705,6 +35712,12 @@ bool ds4_engine_offload_active(const ds4_engine *e) {
  * pin down the partition capacities. Call before populate/HELLO. */
 void ds4_engine_offload_set_worker_role(ds4_engine *e) {
     offload_compute_capacities(e, true /* worker */);
+}
+
+/* Coordinator role: fix the partition capacities so partition_id is populated
+ * before the HELLO is built (bind runs after connect, which is too late). */
+void ds4_engine_offload_set_coordinator_role(ds4_engine *e) {
+    offload_compute_capacities(e, false /* coordinator */);
 }
 
 /* Identity of the expert partition, carried in HELLO.partition_hash so the

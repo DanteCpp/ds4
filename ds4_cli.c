@@ -2304,6 +2304,9 @@ int main(int argc, char **argv) {
      * block only proves the wire handshake end-to-end against a live worker. */
     ds4_offload_client *offload_cli = NULL;
     if (cfg.offload.host && cfg.offload.host[0]) {
+        /* Fix the partition capacities before building HELLO — bind() (which
+         * also sets them) only runs after connect, which is too late. */
+        ds4_engine_offload_set_coordinator_role(engine);
         ds4_offload_hello hello = cli_offload_hello(engine);
         char offerr[256] = "";
         int offport = cfg.offload.port ? cfg.offload.port : DS4_OFFLOAD_DEFAULT_PORT;

@@ -284,6 +284,8 @@ void ds4_engine_offload_enable_loopback(ds4_engine *e);
 /* Worker role: auto-size this machine's offload cache to its wired budget and
  * fix the partition capacities. Call before populate and HELLO on the worker. */
 void ds4_engine_offload_set_worker_role(ds4_engine *e);
+/* Coordinator role: fix the partition capacities before the HELLO is built. */
+void ds4_engine_offload_set_coordinator_role(ds4_engine *e);
 bool ds4_engine_offload_active(const ds4_engine *e);
 /* Identity of the expert partition (for HELLO.partition_hash; both nodes must agree). */
 uint64_t ds4_engine_offload_partition_id(void);
