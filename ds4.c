@@ -21509,12 +21509,13 @@ static uint64_t g_offload_coord_swaps;                /* swaps issued (telemetry
 static bool     g_offload_swap_disabled;              /* DS4_OFFLOAD_NO_SWAP     */
 static bool     g_offload_swap_checked;
 
-/* Per-layer pending swap (deferred from a layer that had n_remote==0).
- * Committed locally, piggybacked on the next EXPERT_REQ for this layer. */
+/* Per-layer ring buffer of swaps deferred from n_remote==0 passes.
+ * Committed locally, flushed on the next EXPERT_REQ for this layer. */
+#define DS4_PENDING_SWAP_MAX 8
 static struct {
-    bool     pending;
-    uint16_t evict;
-    uint16_t load;
+    uint8_t head, tail;   /* ring buffer indices; empty when head==tail */
+    uint16_t evict[DS4_PENDING_SWAP_MAX];
+    uint16_t load[DS4_PENDING_SWAP_MAX];
 } g_offload_pending_swap[DS4_OFFLOAD_N_LAYER];
 
 /* Global rank of (layer, expert): index in the flash hotlist for ranked experts,
@@ -21878,10 +21879,18 @@ static int metal_graph_routed_moe_or_offload(
     if (swap_k > 0) {
         offload_commit_swaps(e, (int)layer_index, swap_evict, swap_load, swap_k);
         if (n_remote == 0) {
-            /* Stash the swap for the next EXPERT_REQ on this layer. */
-            g_offload_pending_swap[layer_index].pending = true;
-            g_offload_pending_swap[layer_index].evict = swap_evict[0];
-            g_offload_pending_swap[layer_index].load  = swap_load[0];
+            /* Push onto the per-layer ring buffer; drop oldest if full. */
+            uint8_t next = (g_offload_pending_swap[layer_index].tail + 1)
+                           % DS4_PENDING_SWAP_MAX;
+            if (next != g_offload_pending_swap[layer_index].head) {
+                g_offload_pending_swap[layer_index]
+                    .evict[g_offload_pending_swap[layer_index].tail] =
+                    swap_evict[0];
+                g_offload_pending_swap[layer_index]
+                    .load[g_offload_pending_swap[layer_index].tail] =
+                    swap_load[0];
+                g_offload_pending_swap[layer_index].tail = next;
+            }
             swap_k = 0;  /* consumed; don't send twice */
         }
     }
@@ -21913,15 +21922,20 @@ static int metal_graph_routed_moe_or_offload(
     uint16_t hidden16[DS4_OFFLOAD_N_EMBD];
     offload_f32_to_f16(norm, hidden16, DS4_OFFLOAD_N_EMBD);
 
-    /* Merge any deferred swap from a previous n_remote==0 pass on this
-     * layer — piggyback it on this real EXPERT_REQ at zero latency cost. */
-    if (g_offload_pending_swap[layer_index].pending) {
+    /* Drain any deferred swaps from previous n_remote==0 passes on this
+     * layer — piggyback them on this real EXPERT_REQ at zero latency cost. */
+    while (g_offload_pending_swap[layer_index].head !=
+           g_offload_pending_swap[layer_index].tail) {
         if (swap_k < DS4_OFFLOAD_N_USED) {
-            swap_evict[swap_k] = g_offload_pending_swap[layer_index].evict;
-            swap_load[swap_k]  = g_offload_pending_swap[layer_index].load;
+            uint8_t h = g_offload_pending_swap[layer_index].head;
+            swap_evict[swap_k] = g_offload_pending_swap[layer_index].evict[h];
+            swap_load[swap_k]  = g_offload_pending_swap[layer_index].load[h];
             swap_k++;
+            g_offload_pending_swap[layer_index].head =
+                (h + 1) % DS4_PENDING_SWAP_MAX;
+        } else {
+            break;  /* swap_evict/load full; remainder stays queued */
         }
-        g_offload_pending_swap[layer_index].pending = false;
     }
 
     uint16_t partial16[DS4_OFFLOAD_N_EMBD];

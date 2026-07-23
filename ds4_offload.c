@@ -923,11 +923,22 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                 continue;
             }
 
-            /* Critical path: compute the routed experts and reply FIRST (§5.3).
-             * A compute failure (GPU error, or the requested expert not resident
-             * in this worker's cache — the invalid-mmap case, H1/H2) is reported
-             * as an ERROR status, never as a valid-looking zero vector, so the
-             * coordinator never folds silent garbage into the residual. */
+            /* Apply the coordinator's swaps BEFORE computing so a
+             * just-loaded expert is present for this request (the
+             * deferred-swap piggyback can carry a load=Y that is also
+             * in the compute set).  Swap cost is on the critical path
+             * but eliminates the race and the extra network message. */
+            if (swap_k > 0 && opt->evict) {
+                opt->evict(opt->user, layer, swap_evict, swap_load, swap_k);
+                agg.evict_hints += swap_k;
+            }
+
+            /* Critical path: compute the routed experts and reply.
+             * A compute failure (GPU error, or the requested expert not
+             * resident in this worker's cache — the invalid-mmap case,
+             * H1/H2) is reported as an ERROR status, never as a
+             * valid-looking zero vector, so the coordinator never
+             * folds silent garbage into the residual. */
             const double compute_t0 = off_now_ms();
             const int compute_rc =
                 opt->compute(opt->user, layer, ids, weights, k, hidden, out);
@@ -991,16 +1002,6 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
             if (!off_send_frame(cfd, DS4_OFFLOAD_FRAME_EXPERT_RESP, respbuf,
                                 OFF_RESP_MAX))
                 break;
-
-            /* After the response (and before the next request is read, so the
-             * loaded expert is guaranteed present when next requested): apply
-             * the coordinator's swaps — evict exactly swap_evict[i], load
-             * swap_load[i] from this worker's own GGUF. Weights never cross the
-             * wire; the coordinator mirrors the identical change (§6). */
-            if (swap_k > 0 && opt->evict) {
-                opt->evict(opt->user, layer, swap_evict, swap_load, swap_k);
-                agg.evict_hints += swap_k;
-            }
         }
 
         off_tok_agg_flush(&agg, opt);
