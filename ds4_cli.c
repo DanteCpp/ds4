@@ -112,18 +112,18 @@ typedef struct {
     const char *gpu_devices_arg;
 } cli_config;
 
-/* Build this process's HELLO from the loaded engine identity plus the verified
- * model constants. partition_hash stays 0 until hotlist partitioning lands
- * (both sides agree on "static full partition"). */
+/* Build this process's HELLO identity from the loaded engine. The v2
+ * orchestration fields (mem_avail / caps / plan_count / partition_hash) are
+ * filled by the caller: the worker offers mem_avail, the coordinator's reply
+ * carries the decided split. */
 static ds4_offload_hello cli_offload_hello(ds4_engine *engine) {
     ds4_offload_hello h = {0};
     h.magic = DS4_OFFLOAD_MAGIC;
-    h.version = 1;
+    h.version = DS4_OFFLOAD_PROTOCOL_VERSION;
     h.n_layer = (uint16_t)ds4_engine_layer_count(engine);
     h.n_used = DS4_OFFLOAD_N_USED;
     h.n_embd = (uint32_t)ds4_engine_embd_dim(engine);
     h.n_routed = DS4_OFFLOAD_N_ROUTED;
-    h.partition_hash = ds4_engine_offload_partition_id();
     h.model_id = (uint64_t)(uint32_t)ds4_engine_model_id(engine);
     return h;
 }
@@ -136,18 +136,35 @@ static int cli_offload_compute(void *user, int layer, const uint16_t *ids,
                                               weights, k, hidden_f16, out_f16);
 }
 
+/* Per-token log suffix: offload-cache residency / wired bytes / hit-miss
+ * counters, so the worker's live log shows the cache is installed correctly
+ * and keeps serving (any miss = a requested expert not resident). */
+static void cli_offload_diag(void *user, char *buf, size_t buflen) {
+    ds4_engine_offload_cache_diag((ds4_engine *)user, buf, buflen);
+}
+
+/* Orchestration (v2): the coordinator's PLAN arrived — install exactly those
+ * experts into this worker's mlock'd cache. */
+static int cli_offload_plan(void *user, uint32_t coord_cap,
+                            const ds4_offload_expert_ref *plan, uint32_t count,
+                            uint32_t *installed, uint64_t *wired_bytes,
+                            char *err, size_t errlen) {
+    return ds4_engine_offload_apply_plan((ds4_engine *)user, coord_cap, plan,
+                                         count, installed, wired_bytes,
+                                         err, errlen);
+}
+
 static volatile int cli_offload_stop;
 
 /* No SA_RESTART: a blocked accept()/read() in the worker loop returns EINTR so
  * the loop observes cli_offload_stop and exits cleanly on ^C / SIGTERM (L1). */
 static void cli_offload_sigint(int sig) { (void)sig; cli_offload_stop = 1; }
 
-/* Fill the mlock'd offload expert cache with this node's share of the partition.
- * Budget 0 = auto: the capacity the caller pinned down beforehand (the worker's
- * wired budget via set_worker_role, or the loopback coordinator's). Shared by the
- * worker and the single-process loopback validator. Returns 0 to continue,
- * non-zero (fatal) on populate error — a partial cache silently returns wrong
- * experts (H2), so we refuse to serve. */
+/* Fill the mlock'd offload expert cache with this node's own worker tier
+ * (single-process loopback validation only — the distributed worker installs
+ * the coordinator's PLAN instead). Budget 0 = auto: this machine's wired
+ * capacity. Returns 0 to continue, non-zero (fatal) on populate error — a
+ * partial cache silently returns wrong experts (H2), so we refuse to serve. */
 static int cli_offload_populate_cache(ds4_engine *engine) {
     char perr[256] = "";
     int n = ds4_engine_offload_populate_cache(engine, 0 /* auto */, perr, sizeof(perr));
@@ -163,9 +180,11 @@ static int cli_offload_populate_cache(ds4_engine *engine) {
     return 0;
 }
 
-/* Run the expert-compute server (mtwo). Loads the model like any ds4 process;
- * for single-machine loopback dev launch it with --ssd-streaming and a small
- * --ssd-streaming-cache-experts so it never mlocks the production ~27 GB. */
+/* Run the expert-compute server (mtwo). Loads the model like any ds4 process
+ * (plain mmap — no --ssd-streaming or env flags needed), then offers its
+ * wired-memory budget in HELLO and waits for the coordinator's orchestration:
+ * the decided expert id list arrives in the PLAN frame and is installed into
+ * the mlock'd offload cache before serving. */
 static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
     if (ds4_engine_embd_dim(engine) != DS4_OFFLOAD_N_EMBD ||
         ds4_engine_layer_count(engine) != DS4_OFFLOAD_N_LAYER) {
@@ -175,12 +194,6 @@ static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
                 DS4_OFFLOAD_N_EMBD, DS4_OFFLOAD_N_LAYER);
         return 2;
     }
-    /* Auto-size the worker's cache to its wired budget, then fill it with the
-     * worker's tier of the hotlist partition. The cache is the sole compute
-     * authority on the worker — the mmap path is invalid in the streaming regime
-     * (H2) — so a populate failure is fatal. */
-    ds4_engine_offload_set_worker_role(engine);
-    if (cli_offload_populate_cache(engine) != 0) return 3;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -193,8 +206,15 @@ static int run_offload_worker(ds4_engine *engine, const cli_config *cfg) {
     opt.bind_host = cfg->offload.bind;
     opt.port = cfg->offload.port;
     opt.hello = cli_offload_hello(engine);
+    opt.hello.mem_avail_bytes = ds4_engine_offload_avail_bytes(engine);
+    fprintf(stderr,
+            "ds4: expert-server: offering %.2f GiB for the expert cache; "
+            "waiting for the coordinator's plan\n",
+            (double)opt.hello.mem_avail_bytes / (1024.0 * 1024.0 * 1024.0));
     opt.compute = cli_offload_compute;
     opt.evict = NULL;                 /* Phase-2 dynamic swaps: not yet */
+    opt.plan = cli_offload_plan;
+    opt.diag = cli_offload_diag;
     opt.user = engine;
     opt.stop = &cli_offload_stop;
     char err[256] = "";
@@ -2153,6 +2173,21 @@ static cli_config parse_options(int argc, char **argv) {
                         "(coordinator) are mutually exclusive\n");
         exit(2);
     }
+    if (c.offload.host && c.offload.host[0] && !c.engine.ssd_streaming) {
+        /* The coordinator must NOT wire the full routed-expert set: it keeps
+         * only its hot tier in RAM and lets the expert tail colder than both
+         * machines' caches stream from local SSD (the last-resort regime).
+         * That is exactly the SSD-streaming weight regime, so --expert-offload
+         * implies it; the streaming cache auto-sizes to the wired budget and
+         * no streaming flags or env vars are needed. The regimes stay
+         * separated in code: offload owns the coordinator<->worker split,
+         * streaming only ever serves the local cold tail. */
+        c.engine.ssd_streaming = true;
+        fprintf(stderr,
+                "ds4: --expert-offload: coordinator runs the SSD-streaming "
+                "weight regime (auto-enabled); the expert tail colder than "
+                "both RAM caches streams from local SSD as the last resort\n");
+    }
     char tp_err[256];
     if (!ds4_tp_adopt_distributed_options(&c.engine.tp, c.dist,
                                           tp_err, sizeof(tp_err))) {
@@ -2296,26 +2331,62 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
-    /* ---- Unit C step 1: coordinator expert-offload client connect ----
-     * Dial the worker and complete the HELLO handshake. On success the worker
-     * (mtwo) prints "coordinator connected" with no reject line. On failure we
-     * fall back to solo streaming (plan Phase-4 graceful degrade). The decode
-     * splice (step 2) is not yet wired, so generation still runs solo here; this
-     * block only proves the wire handshake end-to-end against a live worker. */
+    /* ---- Coordinator expert-offload: connect + orchestration phase ----
+     * Dial the worker, read its memory offer, decide the RAM-first split
+     * (coordinator hottest / worker next / SSD tail last resort), ship the
+     * worker its exact expert id list, and block while the worker installs
+     * it. On any failure we fall back to solo streaming (graceful degrade). */
     ds4_offload_client *offload_cli = NULL;
     if (cfg.offload.host && cfg.offload.host[0]) {
-        /* Fix the partition capacities before building HELLO — bind() (which
-         * also sets them) only runs after connect, which is too late. */
-        ds4_engine_offload_set_coordinator_role(engine);
         ds4_offload_hello hello = cli_offload_hello(engine);
+        hello.mem_avail_bytes = ds4_engine_offload_avail_bytes(engine);
         char offerr[256] = "";
         int offport = cfg.offload.port ? cfg.offload.port : DS4_OFFLOAD_DEFAULT_PORT;
+        ds4_offload_hello worker_hello;
         offload_cli = ds4_offload_client_connect(cfg.offload.host, offport,
-                                                 &hello, 5.0, offerr, sizeof(offerr));
+                                                 &hello, 5.0, &worker_hello,
+                                                 offerr, sizeof(offerr));
         if (offload_cli) {
-            ds4_engine_offload_bind(engine, offload_cli);
-            fprintf(stderr, "ds4: expert-offload: connected to worker %s:%d\n",
-                    cfg.offload.host, offport);
+            fprintf(stderr,
+                    "ds4: expert-offload: worker %s:%d offers %.2f GiB for "
+                    "experts\n", cfg.offload.host, offport,
+                    (double)worker_hello.mem_avail_bytes /
+                        (1024.0 * 1024.0 * 1024.0));
+            ds4_offload_expert_ref *plan =
+                malloc((size_t)DS4_OFFLOAD_PLAN_MAX * sizeof(*plan));
+            uint32_t coord_cap = 0, worker_cap = 0, ssd_tail = 0;
+            uint32_t plan_n = plan
+                ? ds4_engine_offload_decide(engine,
+                                            worker_hello.mem_avail_bytes,
+                                            plan, DS4_OFFLOAD_PLAN_MAX,
+                                            &coord_cap, &worker_cap, &ssd_tail)
+                : 0;
+            ds4_offload_hello decision = hello;
+            decision.partition_hash = ds4_engine_offload_partition_id();
+            decision.coord_cap = coord_cap;
+            decision.worker_cap = worker_cap;
+            decision.plan_count = plan_n;
+            decision.flags = ssd_tail ? DS4_OFFLOAD_HELLO_FLAG_SSD_TAIL : 0;
+            uint32_t installed = 0;
+            uint64_t wired = 0;
+            if (!plan ||
+                ds4_offload_client_orchestrate(offload_cli, &decision, plan,
+                                               plan_n, &installed, &wired,
+                                               offerr, sizeof(offerr)) != 0) {
+                fprintf(stderr, "ds4: expert-offload: orchestration failed (%s); "
+                                "running solo\n",
+                        plan ? offerr : "out of memory");
+                ds4_offload_client_close(offload_cli);
+                offload_cli = NULL;
+            } else {
+                fprintf(stderr,
+                        "ds4: expert-offload: worker installed %u/%u experts "
+                        "(%.2f GiB wired); orchestration complete\n",
+                        installed, plan_n,
+                        (double)wired / (1024.0 * 1024.0 * 1024.0));
+                ds4_engine_offload_bind(engine, offload_cli);
+            }
+            free(plan);
         } else {
             fprintf(stderr, "ds4: expert-offload: connect to %s:%d failed (%s); "
                             "running solo\n", cfg.offload.host, offport, offerr);
@@ -2324,9 +2395,9 @@ int main(int argc, char **argv) {
         /* Single-process validation of the decode splice (no worker): the
          * "remote" experts are computed through this process's own offload cache
          * (the same validated path the worker uses; the mmap path is invalid
-         * under --ssd-streaming, H2). enable_loopback pins the partition caps
-         * (set DS4_OFFLOAD_COORD_EXPERTS + DS4_OFFLOAD_CACHE_EXPERTS), then we
-         * fill the worker tier and decode to confirm parity with a solo run. */
+         * under --ssd-streaming, H2). enable_loopback auto-sizes both tiers to
+         * this machine's wired budget (no env vars needed), then we fill the
+         * worker tier and decode to confirm parity with a solo run. */
         ds4_engine_offload_enable_loopback(engine);
         if (cli_offload_populate_cache(engine) != 0) {
             ds4_engine_close(engine);

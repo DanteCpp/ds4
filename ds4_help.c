@@ -252,10 +252,10 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     fputc('\n', fp);
     title(fp, c, "Expert Offload (DeepSeek-V4-Flash)");
     fputc('\n', fp);
-    para(fp, c, "Two-machine mode where the whole model lives in combined RAM: a coordinator holds the backbone plus the hottest experts, a worker is a stateless expert-compute server holding the colder experts over Thunderbolt (bridge0, plain TCP). On a coordinator cache miss it ships an 8 KB activation to the worker and gets the expert sum back; weights never cross the wire. Start the worker first, then the coordinator. Set DS4_OFFLOAD_CACHE_EXPERTS on the worker to size its mlock'd expert cache.");
+    para(fp, c, "Two-machine mode: a coordinator holds the backbone plus the hottest experts, a worker is a stateless expert-compute server holding the next-colder tier over Thunderbolt (bridge0, plain TCP); only the tail that fits in neither machine's RAM streams from the coordinator's SSD, as the last resort. At startup the two negotiate automatically (orchestration): the worker offers its free memory, the coordinator decides the split and ships the worker the exact expert ids to load. On a coordinator cache miss it ships an 8 KB activation to the worker and gets the expert sum back; weights never cross the wire. Start the worker first, then the coordinator. No SSD-streaming flags or environment variables are needed on either side.");
     fputc('\n', fp);
-    opt(fp, c, "--expert-server", "Run the expert-compute server (worker, e.g. mtwo). Loads the model, then serves EXPERT_REQ frames.");
-    opt(fp, c, "--expert-offload HOST", "Coordinator: dial the worker at HOST and offload routed-expert misses to it.");
+    opt(fp, c, "--expert-server", "Run the expert-compute server (worker, e.g. mtwo). Loads the model, offers its memory, then installs the coordinator's plan and serves EXPERT_REQ frames.");
+    opt(fp, c, "--expert-offload HOST", "Coordinator: dial the worker at HOST, negotiate the expert split, and offload the worker's tier to it. Auto-enables the SSD-streaming regime for the cold tail.");
     opt(fp, c, "--expert-offload-bind IP", "Worker bind address (default: all interfaces).");
     opt(fp, c, "--expert-offload-port N", "TCP port for the offload link. Default: 47300");
     fputc('\n', fp);

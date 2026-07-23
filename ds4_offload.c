@@ -240,43 +240,95 @@ void ds4_offload_residency_split(const ds4_offload_residency *r, int layer,
  * HELLO handshake.
  * --------------------------------------------------------------------- */
 
+/* Identity fields both sides must agree on before any orchestration. The
+ * partition_hash is NOT compared: in v2 the split is decided by the
+ * coordinator during the handshake, so there is nothing to disagree about. */
 static int off_hello_mismatch(const ds4_offload_hello *a,
                               const ds4_offload_hello *b) {
     return a->magic != b->magic || a->version != b->version ||
            a->n_layer != b->n_layer || a->n_used != b->n_used ||
            a->n_embd != b->n_embd || a->n_routed != b->n_routed ||
-           a->partition_hash != b->partition_hash || a->model_id != b->model_id;
+           a->model_id != b->model_id;
 }
 
-/* Exchange HELLO and abort on mismatch. Both sides send their own then read the
- * peer's; symmetric so there is no ordering deadlock on a small frame. */
-static int off_handshake(int fd, const ds4_offload_hello *mine,
-                         char *err, size_t errlen) {
-    if (!off_send_frame(fd, DS4_OFFLOAD_FRAME_HELLO, mine, sizeof(*mine))) {
-        off_set_err(err, errlen, "offload HELLO send failed");
+static int off_hello_check(const ds4_offload_hello *mine,
+                           const ds4_offload_hello *peer,
+                           char *err, size_t errlen) {
+    if (off_hello_mismatch(mine, peer)) {
+        off_set_err(err, errlen,
+                    "offload HELLO mismatch: peer model/protocol differs "
+                    "(model %llx/%llx proto %u/%u layers %u/%u)",
+                    (unsigned long long)mine->model_id,
+                    (unsigned long long)peer->model_id,
+                    mine->version, peer->version,
+                    mine->n_layer, peer->n_layer);
         return -1;
     }
-    ds4_offload_hello peer;
+    return 0;
+}
+
+static int off_hello_recv(int fd, ds4_offload_hello *peer,
+                          char *err, size_t errlen) {
     uint8_t type = 0;
     uint32_t bytes = 0;
-    int rc = off_recv_frame(fd, &type, &peer, sizeof(peer), &bytes);
-    if (rc <= 0 || type != DS4_OFFLOAD_FRAME_HELLO || bytes != sizeof(peer)) {
+    int rc = off_recv_frame(fd, &type, peer, sizeof(*peer), &bytes);
+    if (rc <= 0 || type != DS4_OFFLOAD_FRAME_HELLO || bytes != sizeof(*peer)) {
         off_set_err(err, errlen, "offload HELLO recv failed (rc=%d type=%u)",
                     rc, type);
         return -1;
     }
-    if (off_hello_mismatch(mine, &peer)) {
-        off_set_err(err, errlen,
-                    "offload HELLO mismatch: peer model/partition differs "
-                    "(model %llx/%llx part %llx/%llx layers %u/%u)",
-                    (unsigned long long)mine->model_id,
-                    (unsigned long long)peer.model_id,
-                    (unsigned long long)mine->partition_hash,
-                    (unsigned long long)peer.partition_hash,
-                    mine->n_layer, peer.n_layer);
-        return -1;
-    }
     return 0;
+}
+
+/* PLAN wire format: u32 count, then count x (u16 layer, u16 expert) LE. */
+#define OFF_PLAN_MAX_BYTES (4 + (uint32_t)DS4_OFFLOAD_PLAN_MAX * 4)
+
+static uint32_t off_pack_plan(unsigned char *out,
+                              const ds4_offload_expert_ref *plan,
+                              uint32_t count) {
+    unsigned char *p = out;
+    memcpy(p, &count, 4); p += 4;
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(p, &plan[i].layer, 2); p += 2;
+        memcpy(p, &plan[i].expert, 2); p += 2;
+    }
+    return (uint32_t)(p - out);
+}
+
+static int off_unpack_plan(const unsigned char *in, uint32_t bytes,
+                           ds4_offload_expert_ref *plan, uint32_t max,
+                           uint32_t *count) {
+    if (bytes < 4) return -1;
+    uint32_t n;
+    memcpy(&n, in, 4);
+    if (n > max || bytes != 4 + n * 4) return -1;
+    const unsigned char *p = in + 4;
+    for (uint32_t i = 0; i < n; i++) {
+        memcpy(&plan[i].layer, p, 2); p += 2;
+        memcpy(&plan[i].expert, p, 2); p += 2;
+    }
+    *count = n;
+    return 0;
+}
+
+/* PLAN_ACK wire format: u32 status (0 ok / 1 error), u32 installed,
+ * u64 wired_bytes, then a NUL-free short message (<= 120 B, may be empty). */
+#define OFF_PLAN_ACK_MSG 120
+#define OFF_PLAN_ACK_MAX (4 + 4 + 8 + OFF_PLAN_ACK_MSG)
+
+static uint32_t off_pack_plan_ack(unsigned char *out, uint32_t status,
+                                  uint32_t installed, uint64_t wired_bytes,
+                                  const char *msg) {
+    unsigned char *p = out;
+    memcpy(p, &status, 4); p += 4;
+    memcpy(p, &installed, 4); p += 4;
+    memcpy(p, &wired_bytes, 8); p += 8;
+    if (msg) {
+        size_t m = strlen(msg);
+        if (m > OFF_PLAN_ACK_MSG) m = OFF_PLAN_ACK_MSG;
+        memcpy(p, msg, m); p += m;
+    }
+    return (uint32_t)(p - out);
 }
 
 /* ------------------------------------------------------------------------
@@ -356,18 +408,22 @@ struct ds4_offload_client {
 ds4_offload_client *ds4_offload_client_connect(const char *host, int port,
                                                const ds4_offload_hello *hello,
                                                double timeout_sec,
+                                               ds4_offload_hello *worker_hello,
                                                char *err, size_t errlen) {
     if (port <= 0) port = DS4_OFFLOAD_DEFAULT_PORT;
     int fd = off_dial(host, port, timeout_sec, err, errlen);
     if (fd < 0) return NULL;
     off_socket_tune(fd);
-    if (off_handshake(fd, hello, err, errlen) != 0) {
+    /* Orchestration step 1: the worker speaks first, offering its identity and
+     * available expert-cache memory. No receive timeout yet — the worker may
+     * still be loading its model. The coordinator's own HELLO goes out only
+     * after the split decision (ds4_offload_client_orchestrate). */
+    ds4_offload_hello peer;
+    if (off_hello_recv(fd, &peer, err, errlen) != 0 ||
+        off_hello_check(hello, &peer, err, errlen) != 0) {
         close(fd);
         return NULL;
     }
-    /* Generous vs one round trip (sub-ms) but far below the kernel TCP timeout,
-     * so a worker that dies mid-run fails the next collect rather than hanging. */
-    off_set_rcvtimeo(fd, 15.0);
     ds4_offload_client *c = calloc(1, sizeof(*c));
     if (!c) {
         off_set_err(err, errlen, "offload client: out of memory");
@@ -377,7 +433,73 @@ ds4_offload_client *ds4_offload_client_connect(const char *host, int port,
     c->fd = fd;
     c->next_seq = 1;
     pthread_mutex_init(&c->lock, NULL);
+    if (worker_hello) *worker_hello = peer;
     return c;
+}
+
+int ds4_offload_client_orchestrate(ds4_offload_client *c,
+                                   const ds4_offload_hello *decision,
+                                   const ds4_offload_expert_ref *plan,
+                                   uint32_t count,
+                                   uint32_t *installed,
+                                   uint64_t *wired_bytes,
+                                   char *err, size_t errlen) {
+    if (!c || !decision || (count > 0 && !plan) ||
+        count > DS4_OFFLOAD_PLAN_MAX) {
+        off_set_err(err, errlen, "offload orchestrate: bad arguments");
+        return -1;
+    }
+    pthread_mutex_lock(&c->lock);
+    int rc = -1;
+    unsigned char *planbuf = malloc(count ? 4 + count * 4 : 4);
+    unsigned char ack[OFF_PLAN_ACK_MAX];
+    if (!planbuf) {
+        off_set_err(err, errlen, "offload orchestrate: out of memory");
+        goto done;
+    }
+    /* Orchestration step 2: decision HELLO + PLAN, then block while the worker
+     * installs its assigned experts (pread + mlock; can take minutes). */
+    if (!off_send_frame(c->fd, DS4_OFFLOAD_FRAME_HELLO, decision,
+                        sizeof(*decision))) {
+        off_set_err(err, errlen, "offload orchestrate: HELLO send failed");
+        goto done;
+    }
+    uint32_t pn = off_pack_plan(planbuf, plan, count);
+    if (!off_send_frame(c->fd, DS4_OFFLOAD_FRAME_PLAN, planbuf, pn)) {
+        off_set_err(err, errlen, "offload orchestrate: PLAN send failed");
+        goto done;
+    }
+    uint8_t type = 0;
+    uint32_t bytes = 0;
+    int rr = off_recv_frame(c->fd, &type, ack, sizeof(ack), &bytes);
+    if (rr <= 0 || type != DS4_OFFLOAD_FRAME_PLAN_ACK || bytes < 16) {
+        off_set_err(err, errlen,
+                    "offload orchestrate: PLAN_ACK recv failed (rc=%d type=%u)",
+                    rr, type);
+        goto done;
+    }
+    uint32_t status, ack_installed;
+    uint64_t ack_wired;
+    memcpy(&status, ack, 4);
+    memcpy(&ack_installed, ack + 4, 4);
+    memcpy(&ack_wired, ack + 8, 8);
+    if (status != 0) {
+        char msg[OFF_PLAN_ACK_MSG + 1] = "";
+        if (bytes > 16) memcpy(msg, ack + 16, bytes - 16);
+        off_set_err(err, errlen, "offload orchestrate: worker rejected plan: %s",
+                    msg[0] ? msg : "no detail");
+        goto done;
+    }
+    if (installed) *installed = ack_installed;
+    if (wired_bytes) *wired_bytes = ack_wired;
+    /* Orchestration done; requests now flow. Bound reads so a worker that dies
+     * mid-run fails the next collect rather than hanging (M7). */
+    off_set_rcvtimeo(c->fd, 15.0);
+    rc = 0;
+done:
+    free(planbuf);
+    pthread_mutex_unlock(&c->lock);
+    return rc;
 }
 
 void ds4_offload_client_close(ds4_offload_client *c) {
@@ -462,6 +584,77 @@ int ds4_offload_client_collect(ds4_offload_client *c, uint64_t seq,
  * Worker (expert compute server), §5.3.
  * --------------------------------------------------------------------- */
 
+/* Verbose per-request worker log (every EXPERT_REQ with ids/weights/timing).
+ * The per-token aggregate line is always printed; set
+ * DS4_OFFLOAD_WORKER_VERBOSE=1 for the full request stream. */
+static int off_worker_verbose(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *s = getenv("DS4_OFFLOAD_WORKER_VERBOSE");
+        v = (s && s[0] && s[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+/* Per-token aggregation for the worker's live compute log. One token = one
+ * increasing run of layer requests (the coordinator sends at most one
+ * EXPERT_REQ per layer per token, in layer order); a non-increasing layer id
+ * closes the previous token and flushes its aggregate line. The aggregate
+ * answers "what did the worker execute for this token, how long did it take,
+ * and is the cache still serving": layer-req count, total experts executed,
+ * summed GPU compute time, errors (cache misses surface here), eviction
+ * hints, and the engine's diag suffix (residency / hits / misses). */
+typedef struct {
+    uint64_t tok_no;
+    int open;
+    int layers;                                /* EXPERT_REQs in this token  */
+    int experts;                               /* sum of k over the requests */
+    int errors;                                /* compute failures (= cache misses, H1) */
+    int evict_hints;                           /* evict_k sum                */
+    double compute_ms;                         /* summed compute-callback time */
+    double wall0_ms;                           /* first request of the token   */
+    int prev_layer;
+    uint8_t k[DS4_OFFLOAD_N_LAYER];            /* per-layer k (0 = not seen) */
+    uint16_t ids[DS4_OFFLOAD_N_LAYER][DS4_OFFLOAD_N_USED];
+} off_tok_agg;
+
+static void off_tok_agg_init(off_tok_agg *a) {
+    memset(a, 0, sizeof(*a));
+    a->prev_layer = -1;
+}
+
+static void off_tok_agg_flush(off_tok_agg *a,
+                              const ds4_offload_worker_options *opt) {
+    if (!a->open) return;
+    const double wall_ms = off_now_ms() - a->wall0_ms;
+    char diag[192] = "";
+    if (opt->diag) opt->diag(opt->user, diag, sizeof(diag));
+    fprintf(stderr,
+            "ds4-offload: tok#%llu done: %d layer-reqs, %d experts, "
+            "compute %.2f ms (%.2f ms/layer), wall %.2f ms, "
+            "errors=%d, evict-hints=%d%s%s\n",
+            (unsigned long long)a->tok_no, a->layers, a->experts,
+            a->compute_ms,
+            a->layers > 0 ? a->compute_ms / a->layers : 0.0,
+            wall_ms, a->errors, a->evict_hints,
+            diag[0] ? " | " : "", diag);
+    if (off_worker_verbose()) {
+        fprintf(stderr, "ds4-offload:   tok#%llu experts:",
+                (unsigned long long)a->tok_no);
+        for (int l = 0; l < DS4_OFFLOAD_N_LAYER; l++) {
+            if (!a->k[l]) continue;
+            fprintf(stderr, " L%d=[", l);
+            for (int i = 0; i < a->k[l]; i++)
+                fprintf(stderr, "%s%u", i ? "," : "", (unsigned)a->ids[l][i]);
+            fprintf(stderr, "]");
+        }
+        fprintf(stderr, "\n");
+    }
+    const uint64_t next = a->tok_no + 1;
+    off_tok_agg_init(a);
+    a->tok_no = next;
+}
+
 int ds4_offload_expert_compute_zero(void *user, int layer,
                                     const uint16_t *expert_ids,
                                     const float *weights, int k,
@@ -498,12 +691,96 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
             break;
         }
         off_socket_tune(cfd);
-        if (off_handshake(cfd, &opt->hello, err, errlen) != 0) {
+
+        /* Orchestration phase (v2). Step 1: offer identity + available memory.
+         * Step 2: read the coordinator's decision HELLO, then the PLAN frame
+         * with the exact expert ids to hold, install them (the plan callback
+         * preads + mlocks; this is the slow part of startup), and ACK. Only
+         * then does the request loop below start. */
+        if (!off_send_frame(cfd, DS4_OFFLOAD_FRAME_HELLO, &opt->hello,
+                            sizeof(opt->hello))) {
+            fprintf(stderr, "ds4-offload: HELLO send failed\n");
+            close(cfd);
+            continue;
+        }
+        ds4_offload_hello decision;
+        if (off_hello_recv(cfd, &decision, err, errlen) != 0 ||
+            off_hello_check(&opt->hello, &decision, err, errlen) != 0) {
             fprintf(stderr, "ds4-offload: rejecting coordinator: %s\n", err);
             close(cfd);
             continue;
         }
-        fprintf(stderr, "ds4-offload: coordinator connected\n");
+        fprintf(stderr,
+                "ds4-offload: coordinator connected; plan: %u experts for this "
+                "worker (coordinator keeps %u hottest, SSD tail %s)\n",
+                decision.worker_cap, decision.coord_cap,
+                (decision.flags & DS4_OFFLOAD_HELLO_FLAG_SSD_TAIL)
+                    ? "active on coordinator" : "empty (combined RAM fits all)");
+        if (decision.plan_count != decision.worker_cap ||
+            decision.plan_count > DS4_OFFLOAD_PLAN_MAX) {
+            fprintf(stderr, "ds4-offload: bad plan_count %u (worker_cap %u), "
+                            "dropping\n", decision.plan_count, decision.worker_cap);
+            close(cfd);
+            continue;
+        }
+        {
+            unsigned char *planbuf = malloc(OFF_PLAN_MAX_BYTES);
+            ds4_offload_expert_ref *planrefs =
+                malloc((size_t)DS4_OFFLOAD_PLAN_MAX * sizeof(*planrefs));
+            unsigned char ackbuf[OFF_PLAN_ACK_MAX];
+            uint32_t installed = 0;
+            uint64_t wired = 0;
+            uint32_t status = DS4_OFFLOAD_STATUS_OK;
+            char plan_err[OFF_PLAN_ACK_MSG + 1] = "";
+            uint8_t type = 0;
+            uint32_t bytes = 0;
+            int fr = planbuf && planrefs
+                ? off_recv_frame(cfd, &type, planbuf, OFF_PLAN_MAX_BYTES, &bytes)
+                : -1;
+            if (fr <= 0 || type != DS4_OFFLOAD_FRAME_PLAN ||
+                off_unpack_plan(planbuf, bytes, planrefs,
+                                DS4_OFFLOAD_PLAN_MAX, &installed) != 0 ||
+                installed != decision.plan_count) {
+                fprintf(stderr, "ds4-offload: malformed PLAN frame, dropping\n");
+                free(planbuf); free(planrefs);
+                close(cfd);
+                continue;
+            }
+            uint32_t count = installed;
+            installed = 0;
+            if (!opt->plan) {
+                status = DS4_OFFLOAD_STATUS_ERROR;
+                snprintf(plan_err, sizeof(plan_err),
+                         "worker has no plan callback");
+            } else if (opt->plan(opt->user, decision.coord_cap, planrefs, count,
+                                 &installed, &wired,
+                                 plan_err, sizeof(plan_err) - 1) != 0) {
+                status = DS4_OFFLOAD_STATUS_ERROR;
+            }
+            uint32_t an = off_pack_plan_ack(ackbuf, status, installed, wired,
+                                            plan_err);
+            off_send_frame(cfd, DS4_OFFLOAD_FRAME_PLAN_ACK, ackbuf, an);
+            free(planbuf); free(planrefs);
+            if (status != DS4_OFFLOAD_STATUS_OK) {
+                fprintf(stderr,
+                        "ds4-offload: plan install failed: %s; closing\n",
+                        plan_err[0] ? plan_err : "unknown error");
+                close(cfd);
+                continue;
+            }
+            fprintf(stderr,
+                    "ds4-offload: plan installed: %u/%u experts wired "
+                    "(%.2f GiB); serving\n",
+                    installed, count,
+                    (double)wired / (1024.0 * 1024.0 * 1024.0));
+        }
+
+        /* Per-token aggregation state + session totals (reset per coordinator
+         * connection so the token numbering matches this session). */
+        off_tok_agg agg;
+        off_tok_agg_init(&agg);
+        uint64_t sess_reqs = 0, sess_experts = 0;
+        double sess_compute_ms = 0.0;
 
         /* Per-connection scratch (kept off the stack: 8 KB payloads). */
         unsigned char *reqbuf = malloc(OFF_REQ_MAX);
@@ -543,13 +820,53 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
              * in this worker's cache — the invalid-mmap case, H1/H2) is reported
              * as an ERROR status, never as a valid-looking zero vector, so the
              * coordinator never folds silent garbage into the residual. */
+            const double compute_t0 = off_now_ms();
+            const int compute_rc =
+                opt->compute(opt->user, layer, ids, weights, k, hidden, out);
+            const double compute_ms = off_now_ms() - compute_t0;
             uint8_t status = DS4_OFFLOAD_STATUS_OK;
-            if (opt->compute(opt->user, layer, ids, weights, k, hidden, out) != 0) {
+            if (compute_rc != 0) {
                 status = DS4_OFFLOAD_STATUS_ERROR;
                 memset(out, 0, DS4_OFFLOAD_HIDDEN_F16_BYTES);
                 fprintf(stderr,
                         "ds4-offload: expert compute failed (layer %d k=%d); "
                         "replying ERROR\n", layer, k);
+            }
+
+            if (off_worker_verbose()) {
+                fprintf(stderr,
+                        "ds4-offload:   req seq=%llu L%d k=%d ids=[",
+                        (unsigned long long)seq, layer, k);
+                for (int i = 0; i < k; i++)
+                    fprintf(stderr, "%s%u", i ? "," : "", (unsigned)ids[i]);
+                fprintf(stderr, "] w=[");
+                for (int i = 0; i < k; i++)
+                    fprintf(stderr, "%s%.4f", i ? "," : "", (double)weights[i]);
+                fprintf(stderr, "] compute=%.2f ms %s\n",
+                        compute_ms, compute_rc == 0 ? "ok" : "ERROR");
+            }
+
+            /* Aggregate into the current token. A non-increasing layer id
+             * means the coordinator started the next token: flush first. */
+            if (layer >= 0 && layer < DS4_OFFLOAD_N_LAYER) {
+                if (agg.open && layer <= agg.prev_layer)
+                    off_tok_agg_flush(&agg, opt);
+                if (!agg.open) {
+                    agg.open = 1;
+                    agg.wall0_ms = compute_t0;
+                }
+                agg.layers++;
+                agg.experts += k;
+                agg.errors += (compute_rc != 0);
+                agg.compute_ms += compute_ms;
+                agg.k[layer] = (uint8_t)(k > DS4_OFFLOAD_N_USED
+                                         ? DS4_OFFLOAD_N_USED : k);
+                memcpy(agg.ids[layer], ids,
+                       (size_t)agg.k[layer] * sizeof(uint16_t));
+                agg.prev_layer = layer;
+                sess_reqs++;
+                sess_experts += (uint64_t)k;
+                sess_compute_ms += compute_ms;
             }
             memcpy(respbuf, &seq, 8);
             respbuf[8] = status;
@@ -560,9 +877,22 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
 
             /* Background, after the response: page the evicted experts in from
              * this worker's own SSD copy (§6). Weights never cross the wire. */
-            if (evict_k > 0 && opt->evict)
+            if (evict_k > 0 && opt->evict) {
                 opt->evict(opt->user, layer, evict_ids, evict_k);
+                agg.evict_hints += evict_k;
+            }
         }
+
+        off_tok_agg_flush(&agg, opt);
+        fprintf(stderr,
+                "ds4-offload: session totals: %llu tokens, %llu layer-reqs, "
+                "%llu experts, compute %.2f ms total%s\n",
+                (unsigned long long)agg.tok_no,
+                (unsigned long long)sess_reqs,
+                (unsigned long long)sess_experts, sess_compute_ms,
+                agg.tok_no > 0
+                    ? " (see per-token lines above for per-layer detail)"
+                    : "");
 
         free(reqbuf); free(respbuf); free(hidden); free(out);
         close(cfd);

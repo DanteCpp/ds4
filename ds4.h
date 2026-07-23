@@ -281,17 +281,44 @@ void ds4_engine_offload_bind(ds4_engine *e, ds4_offload_client *client);
  * no worker so the decode splice can be validated single-process. */
 void ds4_engine_offload_seed_residency(ds4_engine *e);
 void ds4_engine_offload_enable_loopback(ds4_engine *e);
-/* Worker role: auto-size this machine's offload cache to its wired budget and
- * fix the partition capacities. Call before populate and HELLO on the worker. */
-void ds4_engine_offload_set_worker_role(ds4_engine *e);
-/* Coordinator role: fix the partition capacities before the HELLO is built. */
-void ds4_engine_offload_set_coordinator_role(ds4_engine *e);
+/* ---- v2 orchestration (startup negotiation, no env vars needed) ---- */
+/* Bytes this machine can wire for the offload expert cache: the GPU wired
+ * limit (or the macOS default wired ceiling) minus a fixed reserve for the
+ * OS and the mmap'd backbone working set. The worker offers this in HELLO. */
+uint64_t ds4_engine_offload_avail_bytes(ds4_engine *e);
+/* Coordinator decision, run after connect with the worker's offered bytes:
+ * fix the split (hottest `*coord_cap` experts stay coordinator-local, the
+ * next `*worker_cap` go to the worker, the remaining `*ssd_tail` coldest
+ * stream from the coordinator's SSD as the last resort) and enumerate the
+ * worker's exact expert ids into `plan` (capacity plan_max >=
+ * DS4_OFFLOAD_PLAN_MAX). Returns the plan count (== *worker_cap). */
+uint32_t ds4_engine_offload_decide(ds4_engine *e, uint64_t worker_avail_bytes,
+                                   ds4_offload_expert_ref *plan,
+                                   uint32_t plan_max,
+                                   uint32_t *coord_cap, uint32_t *worker_cap,
+                                   uint32_t *ssd_tail);
+/* Worker side of the orchestration: adopt the decided split and install
+ * exactly `plan[count]` into the mlock'd offload cache (pread from the GGUF).
+ * Fills *installed / *wired_bytes for the PLAN_ACK. Returns 0 on success;
+ * non-zero (message in err) rejects the plan — a partial cache would silently
+ * serve wrong experts, so the worker refuses to serve. Metal only. */
+int ds4_engine_offload_apply_plan(ds4_engine *e, uint32_t coord_cap,
+                                  const ds4_offload_expert_ref *plan,
+                                  uint32_t count,
+                                  uint32_t *installed, uint64_t *wired_bytes,
+                                  char *err, size_t errlen);
 bool ds4_engine_offload_active(const ds4_engine *e);
 /* Identity of the expert partition (for HELLO.partition_hash; both nodes must agree). */
 uint64_t ds4_engine_offload_partition_id(void);
 ds4_offload_client *ds4_engine_offload_client(const ds4_engine *e);
 const ds4_offload_residency *ds4_engine_offload_residency(const ds4_engine *e);
 void ds4_engine_offload_set_residency(ds4_engine *e, const ds4_offload_residency *r);
+/* Short one-line offload-cache diagnostics string for the worker's per-token
+ * log (ds4_offload_worker_diag_fn): residency vs budget, slab/wired bytes,
+ * mlock failures, and the cache hit/miss counters of the worker compute path
+ * (a miss in steady state means the cache does not hold what the coordinator
+ * asked for — i.e. the cache is not updating/installed correctly). */
+void ds4_engine_offload_cache_diag(ds4_engine *e, char *buf, size_t len);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);

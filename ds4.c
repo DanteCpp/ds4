@@ -35636,32 +35636,49 @@ static uint32_t offload_env_experts(const char *name) {
     return (uint32_t)n;
 }
 
-/* Set the coordinator/worker cache capacities. Each machine auto-sizes its OWN
- * cache to the max its wired limit allows (RAM-first, per the directive); the
- * peer's capacity comes from an env the operator sets identically on both
- * (DS4_OFFLOAD_COORD_EXPERTS / DS4_OFFLOAD_CACHE_EXPERTS), and HELLO's partition
- * id (below) aborts the run if the two sides disagree. `self_is_worker` picks
- * which capacity this machine auto-fills. */
-static void offload_compute_capacities(ds4_engine *e, bool self_is_worker) {
-    /* Reserve headroom over the mlock'd expert cache for the OS, the mmap'd
-     * backbone working set, and transient staging. */
+/* Bytes this machine can wire for the offload expert cache: the GPU wired
+ * limit (or, when iogpu.wired_limit_mb was not raised, macOS's default wired
+ * ceiling of ~2/3 of physical RAM) minus a fixed reserve for the OS, the
+ * mmap'd backbone working set, and transient staging. */
+static uint64_t offload_avail_bytes(void) {
     const uint64_t reserve = 6ull * 1024 * 1024 * 1024;
     uint64_t wired = glm_graph_wired_limit_bytes();
     if (wired == 0) {
-        /* iogpu.wired_limit_mb not raised: fall back to macOS's default wired
-         * ceiling (~2/3 of physical RAM) so auto-sizing still works. */
         const uint64_t ram = glm_graph_host_memory_bytes();
         wired = ram - ram / 3ull;
     }
-    const uint64_t budget = wired > reserve ? wired - reserve : 0;
-    const uint32_t automax = offload_experts_for_bytes(e, budget);
+    return wired > reserve ? wired - reserve : 0;
+}
+
+uint64_t ds4_engine_offload_avail_bytes(ds4_engine *e) {
+    (void)e;
+    return offload_avail_bytes();
+}
+
+/* Set once the split is fixed — by ds4_engine_offload_decide on the
+ * coordinator, ds4_engine_offload_apply_plan on the worker, or
+ * offload_compute_capacities in solo/loopback. bind() must not overwrite a
+ * negotiated split with a locally-computed one. */
+static bool g_offload_caps_decided;
+
+/* Solo/loopback capacities: auto-size BOTH tiers to this machine's wired
+ * budget (the loopback "worker tier" is served by this same process). The
+ * DS4_OFFLOAD_COORD_EXPERTS / DS4_OFFLOAD_CACHE_EXPERTS envs remain as
+ * optional debug clamps; the distributed split never uses them (it comes from
+ * the v2 orchestration handshake). */
+static void offload_compute_capacities(ds4_engine *e, bool self_is_worker) {
+    const uint32_t automax = offload_experts_for_bytes(e, offload_avail_bytes());
+    const uint32_t model_max = (uint32_t)DS4_N_LAYER * (uint32_t)DS4_N_EXPERT;
 
     uint32_t coord = offload_env_experts("DS4_OFFLOAD_COORD_EXPERTS");
     uint32_t worker = offload_env_experts("DS4_OFFLOAD_CACHE_EXPERTS");
-    if (self_is_worker) { if (!worker) worker = automax; }
-    else                { if (!coord)  coord  = automax; }
+    if (!coord) coord = automax;
+    if (!worker) worker = automax;
+    if (coord > model_max) coord = model_max;
+    if (worker > model_max - coord) worker = model_max - coord;
     g_offload_coord_cap = coord;
     g_offload_worker_cap = worker;
+    g_offload_caps_decided = true;
     fprintf(stderr,
             "ds4: offload partition: coordinator caches %u hottest experts, "
             "worker caches next %u (rest stream from SSD). %s auto-sized to %u.\n",
@@ -35686,7 +35703,10 @@ void ds4_engine_offload_bind(ds4_engine *e, ds4_offload_client *client) {
     if (!e) return;
     e->offload_client = client;
     e->offload_active = (client != NULL);
-    offload_compute_capacities(e, false /* coordinator */);
+    /* After a v2 orchestration the split is already decided; only solo/
+     * loopback entry points need the local computation. */
+    if (!g_offload_caps_decided)
+        offload_compute_capacities(e, false /* coordinator */);
     ds4_engine_offload_seed_residency(e);
     g_offload_engine = e->offload_active ? e : NULL;
 }
@@ -35708,21 +35728,8 @@ bool ds4_engine_offload_active(const ds4_engine *e) {
     return e && e->offload_active;
 }
 
-/* Worker role: auto-size this machine's offload cache to its wired budget and
- * pin down the partition capacities. Call before populate/HELLO. */
-void ds4_engine_offload_set_worker_role(ds4_engine *e) {
-    offload_compute_capacities(e, true /* worker */);
-}
-
-/* Coordinator role: fix the partition capacities so partition_id is populated
- * before the HELLO is built (bind runs after connect, which is too late). */
-void ds4_engine_offload_set_coordinator_role(ds4_engine *e) {
-    offload_compute_capacities(e, false /* coordinator */);
-}
-
-/* Identity of the expert partition, carried in HELLO.partition_hash so the
- * coordinator and worker abort if configured with different cache capacities
- * (which would misroute the worker's tier). */
+/* Identity of the decided expert split, carried in the coordinator's
+ * decision HELLO (v2) so the worker can adopt/report the same split id. */
 uint64_t ds4_engine_offload_partition_id(void) {
     return ((uint64_t)g_offload_coord_cap << 32) | (uint64_t)g_offload_worker_cap;
 }
@@ -56730,6 +56737,38 @@ void ds4_offload_selftest_finalize(ds4_engine *e) {
             "FAIL (check command-buffer lifecycle / x dtype)");
 }
 
+/* Worker-side offload-cache serve counters (worker process is single-threaded
+ * on this path). hits = tokens' expert sets served from the mlock'd cache;
+ * misses = requested expert not resident (replied ERROR to the coordinator).
+ * In steady state misses must stay 0 — a growing miss count means the cache
+ * is not installed/updating to match the coordinator's residency split. */
+static uint64_t g_offload_cache_hits = 0, g_offload_cache_misses = 0;
+
+void ds4_engine_offload_cache_diag(ds4_engine *e, char *buf, size_t len) {
+    if (!buf || len == 0) return;
+#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+    (void)e;
+    snprintf(buf, len, "cache: n/a (non-Metal build)");
+#else
+    (void)e;
+    uint32_t resident = 0, budget = 0, slabs = 0;
+    uint64_t bytes = 0;
+    ds4_gpu_offload_cache_stats(&resident, &budget, &slabs, &bytes);
+    const uint64_t mlock_fail = ds4_gpu_offload_cache_mlock_failed_bytes();
+    snprintf(buf, len,
+             "cache: resident=%u/%u slabs=%u wired=%.2f GiB "
+             "mlock-fail=%llu B hits=%llu misses=%llu%s",
+             resident, budget, slabs,
+             (double)bytes / (1024.0 * 1024.0 * 1024.0),
+             (unsigned long long)mlock_fail,
+             (unsigned long long)g_offload_cache_hits,
+             (unsigned long long)g_offload_cache_misses,
+             g_offload_cache_misses > 0
+                 ? "  <-- MISSES: cache not serving some requested experts"
+                 : "");
+#endif
+}
+
 int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
                                        const uint16_t *expert_ids,
                                        const float *weights, int k,
@@ -56767,7 +56806,11 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
                     (uint32_t)DS4_N_EMBD, (uint32_t)DS4_N_EXPERT,
                     DS4_SWIGLU_CLAMP_EXP, layer,
                     expert_ids, weights, k, hidden_f16, out_f16);
-            if (rc == 0) return 0;      /* served from the offload cache */
+            if (rc == 0) {
+                g_offload_cache_hits++;
+                return 0;               /* served from the offload cache */
+            }
+            g_offload_cache_misses++;
             fprintf(stderr,
                     "ds4: offload worker: layer %d expert not resident in cache "
                     "(rc=%d); refusing to serve from the invalid mmap path\n",
@@ -56794,38 +56837,85 @@ int ds4_engine_offload_compute_experts(ds4_engine *e, int layer,
             expert_ids, weights, k, hidden_f16, out_f16);
 }
 
-int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
-                                      char *err, size_t errlen) {
-#if defined(DS4_NO_GPU) || !defined(__APPLE__)
-    (void)e; (void)budget_experts;
-    if (err) snprintf(err, errlen, "offload expert cache requires the Metal backend");
-    return -1;
-#else
-    if (!e) {
-        if (err) snprintf(err, errlen, "offload populate: null engine");
-        return -1;
-    }
-    /* budget 0 = auto: fill this worker's cache to its capacity (set by
-     * ds4_engine_offload_set_worker_role before populate). */
-    if (budget_experts == 0) budget_experts = g_offload_worker_cap;
-    if (budget_experts == 0) return 0;
+/* Coordinator's split decision (v2 orchestration). RAM-first: the hottest
+ * experts that fit the coordinator's wired budget stay local, the worker gets
+ * the next-hotter tier that fits ITS offered budget, and only the remaining
+ * coldest tail streams from the coordinator's SSD (the last resort). The two
+ * DS4_OFFLOAD_*_EXPERTS envs survive as optional debug clamps; nothing here
+ * requires them. */
+uint32_t ds4_engine_offload_decide(ds4_engine *e, uint64_t worker_avail_bytes,
+                                   ds4_offload_expert_ref *plan,
+                                   uint32_t plan_max,
+                                   uint32_t *coord_cap_out,
+                                   uint32_t *worker_cap_out,
+                                   uint32_t *ssd_tail_out) {
+    if (!e) return 0;
+    const uint32_t model_max =
+        (uint32_t)DS4_OFFLOAD_N_LAYER * (uint32_t)DS4_OFFLOAD_N_ROUTED;
+    uint32_t coord = offload_experts_for_bytes(e, offload_avail_bytes());
+    uint32_t worker = offload_experts_for_bytes(e, worker_avail_bytes);
+    uint32_t env;
+    if ((env = offload_env_experts("DS4_OFFLOAD_COORD_EXPERTS")) && env < coord)
+        coord = env;
+    if ((env = offload_env_experts("DS4_OFFLOAD_CACHE_EXPERTS")) && env < worker)
+        worker = env;
+    if (coord > model_max) coord = model_max;
+    if (worker > model_max - coord) worker = model_max - coord;
 
+    g_offload_coord_cap = coord;
+    g_offload_worker_cap = worker;
+    g_offload_caps_decided = true;
+
+    /* Enumerate the worker's tier: every (layer, expert) whose hotlist rank
+     * falls in [coord_cap, coord_cap + worker_cap). Order is irrelevant — the
+     * worker cache is a set — but deterministic across runs. */
+    uint32_t n = 0;
+    if (plan) {
+        for (int l = 0; l < DS4_OFFLOAD_N_LAYER && n < worker; l++) {
+            for (int x = 0; x < DS4_OFFLOAD_N_ROUTED && n < worker; x++) {
+                const long r = (long)offload_hotlist_rank(l, x);
+                if (r >= (long)coord && r < (long)coord + (long)worker &&
+                    n < plan_max) {
+                    plan[n].layer = (uint16_t)l;
+                    plan[n].expert = (uint16_t)x;
+                    n++;
+                }
+            }
+        }
+    }
+    const uint32_t tail = model_max - coord - worker;
+    fprintf(stderr,
+            "ds4: expert-offload decision: coordinator RAM <- %u hottest "
+            "experts, worker RAM <- next %u, ", coord, worker);
+    if (tail)
+        fprintf(stderr,
+                "SSD tail = %u coldest experts (stream from coordinator SSD, "
+                "last resort)\n", tail);
+    else
+        fprintf(stderr, "combined RAM covers all %u experts (no SSD tail)\n",
+                model_max);
+
+    if (coord_cap_out) *coord_cap_out = coord;
+    if (worker_cap_out) *worker_cap_out = worker;
+    if (ssd_tail_out) *ssd_tail_out = tail;
+    return n;
+}
+
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+/* Shared install engine for the mlock'd offload cache: configure the slot
+ * geometry + budget, then pread each listed expert's gate/up/down into a slab
+ * slot. 0 on success (*installed_out / *wired_out filled), -1 on error. */
+static int offload_cache_install_list(ds4_engine *e,
+                                      const ds4_offload_expert_ref *list,
+                                      uint32_t count, uint32_t budget,
+                                      uint32_t *installed_out,
+                                      uint64_t *wired_out,
+                                      char *err, size_t errlen) {
     const int n_layer = ds4_engine_layer_count(e);
     if (n_layer <= 0 || n_layer > DS4_OFFLOAD_N_LAYER) {
         if (err) snprintf(err, errlen,
-                          "offload populate: unexpected layer count %d", n_layer);
+                          "offload install: unexpected layer count %d", n_layer);
         return -1;
-    }
-
-    /* M1: clamp the budget to the model's true expert count so a stray env value
-     * cannot ask for more experts than exist (and, below, cannot overcommit
-     * RAM). 43 layers x 256 routed = 11008 max. */
-    const uint32_t max_experts = (uint32_t)n_layer * (uint32_t)DS4_N_EXPERT;
-    if (budget_experts > max_experts) {
-        fprintf(stderr,
-                "ds4: offload cache budget %u exceeds %u experts in the model; "
-                "clamping to %u\n", budget_experts, max_experts, max_experts);
-        budget_experts = max_experts;
     }
 
     /* Slot layout is uniform across layers; size it from layer 0 and configure. */
@@ -56833,7 +56923,7 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
     if (!streaming_layer_gate_down_expert_bytes(&e->weights.layer[0],
                                                 &gate_expert_bytes,
                                                 &down_expert_bytes)) {
-        if (err) snprintf(err, errlen, "offload populate: cannot size layer-0 experts");
+        if (err) snprintf(err, errlen, "offload install: cannot size layer-0 experts");
         return -1;
     }
 
@@ -56841,27 +56931,27 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
      * The offload cache is mlock'd, so unlike the mmap backbone it cannot be
      * reclaimed under pressure — overcommitting drives compressor thrash. */
     const uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
-    const uint64_t planned_bytes = (uint64_t)budget_experts * slot_bytes;
+    const uint64_t planned_bytes = (uint64_t)budget * slot_bytes;
     const uint64_t phys_ram = glm_graph_host_memory_bytes();
     fprintf(stderr,
             "ds4: offload cache plan: %u experts x %.2f MiB = %.2f GiB mlock'd\n",
-            budget_experts, (double)slot_bytes / (1024.0 * 1024.0),
+            budget, (double)slot_bytes / (1024.0 * 1024.0),
             (double)planned_bytes / (1024.0 * 1024.0 * 1024.0));
     if (phys_ram > 0 && planned_bytes > phys_ram - phys_ram / 10ull) {
         fprintf(stderr,
                 "ds4: WARNING: offload cache (%.2f GiB) exceeds 90%% of physical "
-                "RAM (%.2f GiB); expect paging/OOM. Lower DS4_OFFLOAD_CACHE_EXPERTS.\n",
+                "RAM (%.2f GiB); expect paging/OOM.\n",
                 (double)planned_bytes / (1024.0 * 1024.0 * 1024.0),
                 (double)phys_ram / (1024.0 * 1024.0 * 1024.0));
     }
 
     if (ds4_gpu_offload_cache_configure(gate_expert_bytes, down_expert_bytes,
-                                        budget_experts, err, errlen) != 0) {
+                                        budget, err, errlen) != 0) {
         return -1;
     }
 
-    /* Precompute per-layer expert geometry so the round-robin fill below stays
-     * simple. All bounds validated up front. */
+    /* Precompute per-layer expert geometry so the fill below stays simple.
+     * All bounds validated up front. */
     uint64_t l_gbytes[DS4_OFFLOAD_N_LAYER], l_dbytes[DS4_OFFLOAD_N_LAYER];
     uint64_t l_goff[DS4_OFFLOAD_N_LAYER], l_uoff[DS4_OFFLOAD_N_LAYER];
     uint64_t l_doff[DS4_OFFLOAD_N_LAYER];
@@ -56869,13 +56959,13 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
         const ds4_layer_weights *l = &e->weights.layer[layer];
         if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) {
             if (err) snprintf(err, errlen,
-                              "offload populate: layer %d missing expert tensors", layer);
+                              "offload install: layer %d missing expert tensors", layer);
             return -1;
         }
         if (!streaming_layer_gate_down_expert_bytes(l, &l_gbytes[layer],
                                                     &l_dbytes[layer])) {
             if (err) snprintf(err, errlen,
-                              "offload populate: cannot size layer %d experts", layer);
+                              "offload install: cannot size layer %d experts", layer);
             return -1;
         }
         l_goff[layer] = l->ffn_gate_exps->abs_offset;
@@ -56883,33 +56973,30 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
         l_doff[layer] = l->ffn_down_exps->abs_offset;
     }
 
-    /* Install exactly the worker's tier of the hotlist partition — the experts
-     * the coordinator will miss on (is_remote per (layer, expert)). The
-     * coordinator seeds the complementary residency, so their union is the whole
-     * model minus the coldest SSD tail: every coordinator miss the worker holds
-     * is a worker hit (plan §2). A too-small budget just leaves some worker-tier
-     * experts uncached; the worker then replies ERROR and the coordinator falls
-     * back to local compute (still correct, H1/H2). */
     uint32_t installed = 0;
-    for (int x = 0; x < (int)DS4_N_EXPERT && installed < budget_experts; x++) {
-        for (int layer = 0; layer < n_layer && installed < budget_experts; layer++) {
-            if (!offload_expert_is_remote(layer, x)) continue;   /* not this worker's */
-            const uint64_t g_bytes = l_gbytes[layer], d_bytes = l_dbytes[layer];
-            if ((uint64_t)x > UINT64_MAX / g_bytes ||
-                (uint64_t)x > UINT64_MAX / d_bytes) {
-                if (err) snprintf(err, errlen, "offload populate: offset overflow");
-                return -1;
-            }
-            const int rc = ds4_gpu_offload_cache_install_expert(
-                    layer, x,
-                    l_goff[layer] + (uint64_t)x * g_bytes,
-                    l_uoff[layer] + (uint64_t)x * g_bytes,
-                    l_doff[layer] + (uint64_t)x * d_bytes,
-                    g_bytes, d_bytes, err, errlen);
-            if (rc < 0) return -1;
-            if (rc == 0) installed++;
-            /* rc == 1: cache-internal budget full; the loop guard stops us. */
+    for (uint32_t i = 0; i < count; i++) {
+        const int layer = (int)list[i].layer;
+        const int x = (int)list[i].expert;
+        if (layer < 0 || layer >= n_layer || x < 0 || x >= (int)DS4_N_EXPERT) {
+            if (err) snprintf(err, errlen,
+                              "offload install: bad ref L%d E%d", layer, x);
+            return -1;
         }
+        const uint64_t g_bytes = l_gbytes[layer], d_bytes = l_dbytes[layer];
+        if ((uint64_t)x > UINT64_MAX / g_bytes ||
+            (uint64_t)x > UINT64_MAX / d_bytes) {
+            if (err) snprintf(err, errlen, "offload install: offset overflow");
+            return -1;
+        }
+        const int rc = ds4_gpu_offload_cache_install_expert(
+                layer, x,
+                l_goff[layer] + (uint64_t)x * g_bytes,
+                l_uoff[layer] + (uint64_t)x * g_bytes,
+                l_doff[layer] + (uint64_t)x * d_bytes,
+                g_bytes, d_bytes, err, errlen);
+        if (rc < 0) return -1;
+        if (rc == 0) installed++;
+        /* rc == 1: cache-internal budget full; reported via installed < count. */
     }
 
     /* M2: one prominent warning at the end (not buried mid-scroll) if any slab
@@ -56925,6 +57012,115 @@ int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
                 "ds4: ================================================================\n",
                 (double)unlocked / (1024.0 * 1024.0 * 1024.0));
     }
+    if (installed_out) *installed_out = installed;
+    if (wired_out) *wired_out = (uint64_t)installed * slot_bytes;
+    return 0;
+}
+#endif /* Metal */
+
+int ds4_engine_offload_apply_plan(ds4_engine *e, uint32_t coord_cap,
+                                  const ds4_offload_expert_ref *plan,
+                                  uint32_t count,
+                                  uint32_t *installed, uint64_t *wired_bytes,
+                                  char *err, size_t errlen) {
+#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+    (void)e; (void)coord_cap; (void)plan; (void)count;
+    (void)installed; (void)wired_bytes;
+    if (err) snprintf(err, errlen, "offload expert cache requires the Metal backend");
+    return -1;
+#else
+    if (!e || (count > 0 && !plan) || count > DS4_OFFLOAD_PLAN_MAX) {
+        if (err) snprintf(err, errlen, "offload apply-plan: bad arguments");
+        return -1;
+    }
+    /* Adopt the coordinator's split: this worker holds exactly the plan. */
+    g_offload_coord_cap = coord_cap;
+    g_offload_worker_cap = count;
+    g_offload_caps_decided = true;
+    uint32_t inst = 0;
+    uint64_t wired = 0;
+    if (count == 0) {
+        /* Degenerate but valid: the coordinator's RAM covers the whole model;
+         * this worker serves nothing. Skip cache configure (budget 0 invalid). */
+        if (installed) *installed = 0;
+        if (wired_bytes) *wired_bytes = 0;
+        return 0;
+    }
+    if (offload_cache_install_list(e, plan, count, count, &inst, &wired,
+                                   err, errlen) != 0)
+        return -1;
+    if (inst != count) {
+        /* A partial cache would serve ERRORs for experts the coordinator
+         * believes are remote — refuse instead (H2). */
+        if (err) snprintf(err, errlen,
+                          "offload apply-plan: installed %u of %u (budget full?)",
+                          inst, count);
+        return -1;
+    }
+    if (installed) *installed = inst;
+    if (wired_bytes) *wired_bytes = wired;
+    return 0;
+#endif
+}
+
+/* Solo/loopback entry point: install this machine's own worker tier (the
+ * rank window above g_offload_coord_cap) without any peer. The distributed
+ * path uses ds4_engine_offload_apply_plan instead. */
+int ds4_engine_offload_populate_cache(ds4_engine *e, uint32_t budget_experts,
+                                      char *err, size_t errlen) {
+#if defined(DS4_NO_GPU) || !defined(__APPLE__)
+    (void)e; (void)budget_experts;
+    if (err) snprintf(err, errlen, "offload expert cache requires the Metal backend");
+    return -1;
+#else
+    if (!e) {
+        if (err) snprintf(err, errlen, "offload populate: null engine");
+        return -1;
+    }
+    /* budget 0 = auto: fill to this machine's capacity (the caps are fixed by
+     * offload_compute_capacities, run on role selection if not already set). */
+    if (!g_offload_caps_decided)
+        offload_compute_capacities(e, true /* worker */);
+    if (budget_experts == 0) budget_experts = g_offload_worker_cap;
+    if (budget_experts == 0) return 0;
+
+    /* M1: clamp the budget to the model's true expert count so a stray value
+     * cannot ask for more experts than exist (43 x 256 = 11008 max). */
+    const uint32_t max_experts =
+        (uint32_t)DS4_OFFLOAD_N_LAYER * (uint32_t)DS4_OFFLOAD_N_ROUTED;
+    if (budget_experts > max_experts) {
+        fprintf(stderr,
+                "ds4: offload cache budget %u exceeds %u experts in the model; "
+                "clamping to %u\n", budget_experts, max_experts, max_experts);
+        budget_experts = max_experts;
+    }
+
+    /* The solo/loopback tier is the same hotlist rank window the distributed
+     * decision enumerates for the worker. */
+    ds4_offload_expert_ref *list =
+        malloc((size_t)max_experts * sizeof(*list));
+    if (!list) {
+        if (err) snprintf(err, errlen, "offload populate: out of memory");
+        return -1;
+    }
+    uint32_t n = 0;
+    const long lo = (long)g_offload_coord_cap;
+    const long hi = lo + (long)budget_experts;
+    for (int l = 0; l < DS4_OFFLOAD_N_LAYER && n < budget_experts; l++) {
+        for (int x = 0; x < DS4_OFFLOAD_N_ROUTED && n < budget_experts; x++) {
+            const long r = (long)offload_hotlist_rank(l, x);
+            if (r >= lo && r < hi) {
+                list[n].layer = (uint16_t)l;
+                list[n].expert = (uint16_t)x;
+                n++;
+            }
+        }
+    }
+    uint32_t installed = 0;
+    const int rc = offload_cache_install_list(e, list, n, budget_experts,
+                                              &installed, NULL, err, errlen);
+    free(list);
+    if (rc != 0) return -1;
     return (int)installed;
 #endif
 }
