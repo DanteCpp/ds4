@@ -21918,6 +21918,23 @@ static int metal_graph_routed_moe_or_offload(
         return OFFLOAD_PASSTHROUGH();
     }
 
+    /* One-shot diagnostic: which offload branch is live, and does the shared
+     * expert actually overlap (router_readback_done)? Answers whether the
+     * §5.2 shared-expert overlap engages for this model/config. */
+    {
+        static bool logged_path;
+        if (!logged_path) {
+            logged_path = true;
+            fprintf(stderr,
+                    "ds4: offload splice active: router_readback_done=%d -> "
+                    "shared-expert overlap %s\n",
+                    (int)router_readback_done,
+                    router_readback_done ? "ENGAGED"
+                                         : "NOT engaged (plain path: shared runs "
+                                           "serially, round trip exposed)");
+        }
+    }
+
     /* Session log: snapshot the streaming-cache counters; the tail-miss
      * delta over the local compute below counts only genuine SSD-tail
      * reads (experts that live on neither coordinator cache nor worker). */
