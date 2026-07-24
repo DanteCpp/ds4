@@ -21718,9 +21718,24 @@ static void offload_commit_swaps(ds4_engine *e, int layer,
     ds4_offload_residency *res =
         (ds4_offload_residency *)ds4_engine_offload_residency(e);
     if (!res) return;
+    /* Mirror the worker's ds4_gpu_offload_cache_swap_expert() state machine
+     * EXACTLY, in the same array order, so the two caches can never diverge —
+     * even when one EXPERT_REQ carries several swaps that conflict (e.g. two
+     * entries naming the same evict slot, or a load an earlier entry already
+     * brought onto the worker). "On the worker" == residency==false. A plain
+     * unconditional bit-set here (the old code) drifts from the worker on any
+     * such conflict, which is what produced the rising cache misses / ERRORs. */
     for (int i = 0; i < swap_k; i++) {
-        ds4_offload_residency_set(res, layer, (int)swap_load[i], false);  /* -> worker */
-        ds4_offload_residency_set(res, layer, (int)swap_evict[i], true);  /* -> local  */
+        const int load  = (int)swap_load[i];
+        const int evict = (int)swap_evict[i];
+        if (load  < 0 || load  >= DS4_OFFLOAD_N_ROUTED ||
+            evict < 0 || evict >= DS4_OFFLOAD_N_ROUTED) continue;
+        /* Worker: load target already resident -> LRU-promote only, no evict. */
+        if (!ds4_offload_residency_get(res, layer, load)) continue;
+        /* Worker: evict victim not resident -> refuses the swap, no change. */
+        if (ds4_offload_residency_get(res, layer, evict)) continue;
+        ds4_offload_residency_set(res, layer, load,  false);  /* -> worker */
+        ds4_offload_residency_set(res, layer, evict, true);   /* -> local  */
         g_offload_coord_swaps++;
     }
 }
@@ -21869,38 +21884,29 @@ static int metal_graph_routed_moe_or_offload(
                                    local_idx, n_local, remote_idx, n_remote,
                                    swap_evict, swap_load);
 
-    /* Commit any planned swap NOW — even when this layer has no remote
-     * experts.  An SSD-read expert is hot by definition and must become
-     * coordinator-resident immediately so the next access hits RAM, not
-     * SSD.  The residency update is local; the worker is told later when a
-     * real EXPERT_REQ next fires for this same layer, piggybacking the
-     * deferred swap.  During the gap a demoted Y that gets requested will
-     * cause an ERROR -> local-fallback (rare). */
-    if (swap_k > 0) {
-        if (n_remote == 0) {
-            /* Queue for later delivery — commit deferred until the
-             * worker actually receives it, so the bitmap cannot
-             * diverge. */
-            g_offload_pending_swap[layer_index]
-                .evict[g_offload_pending_swap[layer_index].tail] =
-                swap_evict[0];
-            g_offload_pending_swap[layer_index]
-                .load[g_offload_pending_swap[layer_index].tail] =
-                swap_load[0];
-            uint8_t next = (g_offload_pending_swap[layer_index].tail + 1)
-                           % DS4_PENDING_SWAP_MAX;
-            if (next == g_offload_pending_swap[layer_index].head) {
-                g_offload_pending_swap[layer_index].head =
-                    (g_offload_pending_swap[layer_index].head + 1)
-                    % DS4_PENDING_SWAP_MAX;
-            }
-            g_offload_pending_swap[layer_index].tail = next;
-            swap_k = 0;
-        } else {
-            /* n_remote > 0: commit now, the worker will receive it. */
-            offload_commit_swaps(e, (int)layer_index,
-                                swap_evict, swap_load, swap_k);
+    /* A swap is committed to the residency bitmap ONLY when the worker is
+     * guaranteed to receive the same swap — i.e. after a successful send inside
+     * offload_fetch_remote_partial(). That single commit point (mirroring the
+     * worker's apply order) is what keeps the two caches in lock-step; a commit
+     * here, before the send, would let the bitmap run ahead of the worker.
+     *
+     * When this layer fires no remote request (n_remote==0) there is no frame to
+     * carry the swap, so queue it and let the next real EXPERT_REQ for this layer
+     * drain and deliver it. The bitmap stays unchanged until then. */
+    if (swap_k > 0 && n_remote == 0) {
+        g_offload_pending_swap[layer_index]
+            .evict[g_offload_pending_swap[layer_index].tail] = swap_evict[0];
+        g_offload_pending_swap[layer_index]
+            .load[g_offload_pending_swap[layer_index].tail] = swap_load[0];
+        uint8_t next = (g_offload_pending_swap[layer_index].tail + 1)
+                       % DS4_PENDING_SWAP_MAX;
+        if (next == g_offload_pending_swap[layer_index].head) {
+            g_offload_pending_swap[layer_index].head =
+                (g_offload_pending_swap[layer_index].head + 1)
+                % DS4_PENDING_SWAP_MAX;
         }
+        g_offload_pending_swap[layer_index].tail = next;
+        swap_k = 0;
     }
 
     if (n_remote == 0) {          /* all experts resident: plain local compute */
@@ -21930,11 +21936,10 @@ static int metal_graph_routed_moe_or_offload(
     uint16_t hidden16[DS4_OFFLOAD_N_EMBD];
     offload_f32_to_f16(norm, hidden16, DS4_OFFLOAD_N_EMBD);
 
-    /* Drain any deferred swaps from previous n_remote==0 passes on this
-     * layer — piggyback them on this real EXPERT_REQ at zero latency cost.
-     * Commit them NOW: the worker is about to receive them, so the bitmap
-     * and the worker's cache stay in lock-step. */
-    int drained = 0;
+    /* Drain any deferred swaps from previous n_remote==0 passes on this layer —
+     * piggyback them on this real EXPERT_REQ at zero latency cost. The whole
+     * batch (fresh + drained) is committed exactly once, post-send, inside
+     * offload_fetch_remote_partial(), mirroring the worker's apply order. */
     while (g_offload_pending_swap[layer_index].head !=
            g_offload_pending_swap[layer_index].tail) {
         if (swap_k < DS4_OFFLOAD_N_USED) {
@@ -21942,17 +21947,12 @@ static int metal_graph_routed_moe_or_offload(
             swap_evict[swap_k] = g_offload_pending_swap[layer_index].evict[h];
             swap_load[swap_k]  = g_offload_pending_swap[layer_index].load[h];
             swap_k++;
-            drained++;
             g_offload_pending_swap[layer_index].head =
                 (h + 1) % DS4_PENDING_SWAP_MAX;
         } else {
             break;  /* swap_evict/load full; remainder stays queued */
         }
     }
-    if (drained > 0)
-        offload_commit_swaps(e, (int)layer_index,
-                            swap_evict + swap_k - drained,
-                            swap_load + swap_k - drained, drained);
 
     uint16_t partial16[DS4_OFFLOAD_N_EMBD];
     const double net_t0 = olog ? now_sec() : 0.0;
