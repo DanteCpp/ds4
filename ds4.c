@@ -21572,20 +21572,30 @@ static void offload_f16_to_f32(const uint16_t *in, float *out, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) { _Float16 h; memcpy(&h, &in[i], sizeof(h)); out[i] = (float)h; }
 }
 
-/* Fetch the weighted sum of the remote experts from the worker (or, with no
- * client bound, compute it locally via ds4_engine_offload_compute_experts — the
- * single-process loopback used to validate the splice arithmetic here on mone,
- * which reads the local offload cache the same way the worker does).
- * Returns 0 on success (out16 = f16 partial), non-zero to trigger local fallback. */
 static void offload_commit_swaps(ds4_engine *e, int layer,
                                  const uint16_t *swap_evict,
                                  const uint16_t *swap_load, int swap_k);
 
-static int offload_fetch_remote_partial(ds4_engine *e, int layer,
-                                        const uint16_t *ids, const float *w, int k,
-                                        const uint16_t *hidden_f16, uint16_t *out16,
-                                        const uint16_t *swap_evict,
-                                        const uint16_t *swap_load, int swap_k) {
+/* Split remote-partial fetch into ISSUE (send) and COLLECT (receive) so the
+ * caller can run the local experts on the GPU between them — the local compute
+ * hides the worker round trip. Two forms:
+ *
+ *   - Distributed (client bound): issue sends the EXPERT_REQ, mirrors the swaps
+ *     into our residency belief (the worker will apply the identical change),
+ *     and returns the seq (>0) to collect after the local compute. collect then
+ *     blocks for the worker's partial.
+ *   - Loopback (no client): there is no wire to overlap, so issue computes the
+ *     "remote" partial synchronously through this process's own offload cache
+ *     (into out16) and applies/mirrors the swaps; it returns 0 and collect is a
+ *     no-op.
+ *
+ * issue returns >0 (client seq), 0 (loopback done, out16 filled), or -1 on a
+ * transport error (caller falls back to full local compute). */
+static int64_t offload_issue_remote_partial(ds4_engine *e, int layer,
+                                            const uint16_t *ids, const float *w, int k,
+                                            const uint16_t *hidden_f16, uint16_t *out16,
+                                            const uint16_t *swap_evict,
+                                            const uint16_t *swap_load, int swap_k) {
     ds4_offload_client *c = ds4_engine_offload_client(e);
     if (c) {
         char err[160] = "";
@@ -21597,13 +21607,11 @@ static int offload_fetch_remote_partial(ds4_engine *e, int layer,
          * mirror them into our residency belief now — the two stay in lock-step
          * even if the response is lost below. */
         offload_commit_swaps(e, layer, swap_evict, swap_load, swap_k);
-        int rc = ds4_offload_client_collect(c, seq, out16, err, sizeof(err));
-        if (rc != 0) { fprintf(stderr, "ds4: offload collect L%d: %s\n", layer, err); return -1; }
-        return 0;
+        return (int64_t)seq;
     }
     /* Loopback (no worker): compute the "remote" partial through this process's
      * own offload cache, and apply the swaps locally so the mechanism is
-     * exercised on-box (mone) exactly as the worker would. */
+     * exercised on-box (mone) exactly as the worker would. No overlap. */
     int rc = ds4_engine_offload_compute_experts(e, layer, ids, w, k, hidden_f16, out16);
     for (int i = 0; i < swap_k; i++) {
         char err[160] = "";
@@ -21614,7 +21622,21 @@ static int offload_fetch_remote_partial(ds4_engine *e, int layer,
                     layer, swap_evict[i], swap_load[i], err);
     }
     offload_commit_swaps(e, layer, swap_evict, swap_load, swap_k);
-    return rc;
+    return rc == 0 ? 0 : -1;
+}
+
+/* Collect the partial for the seq returned by offload_issue_remote_partial.
+ * seq <= 0 is loopback (out16 already filled) -> no-op success. Returns 0 on
+ * success, -1 on transport / worker-ERROR (out16 untouched -> local fallback). */
+static int offload_collect_remote_partial(ds4_engine *e, int layer,
+                                          int64_t seq, uint16_t *out16) {
+    if (seq <= 0) return 0;
+    ds4_offload_client *c = ds4_engine_offload_client(e);
+    if (!c) return 0;
+    char err[160] = "";
+    int rc = ds4_offload_client_collect(c, (uint64_t)seq, out16, err, sizeof(err));
+    if (rc != 0) { fprintf(stderr, "ds4: offload collect L%d: %s\n", layer, err); return -1; }
+    return 0;
 }
 
 /* Plan one coordinator-authoritative cache swap for a fired layer, implementing
@@ -21956,18 +21978,78 @@ static int metal_graph_routed_moe_or_offload(
 
     uint16_t partial16[DS4_OFFLOAD_N_EMBD];
     const double net_t0 = olog ? now_sec() : 0.0;
-    const int fetch_rc = offload_fetch_remote_partial(e, (int)layer_index,
-                                                      rids, rw, n_remote,
-                                                      hidden16, partial16,
-                                                      swap_evict, swap_load, swap_k);
-    const double net_ms = olog ? (now_sec() - net_t0) * 1000.0 : 0.0;
-    if (fetch_rc != 0) {
-        /* Worker drop / error: full local compute is still correct (§Phase-3). */
+
+    /* OVERLAP (plan §5.2): issue the remote request FIRST, then run the local
+     * resident experts on the GPU, submit that work, and only THEN block for the
+     * worker's partial — so the coordinator's own GPU compute hides the round
+     * trip instead of stalling on it. In loopback the partial is computed
+     * synchronously inside issue (no wire to overlap). */
+    int64_t issue = offload_issue_remote_partial(e, (int)layer_index,
+                                                 rids, rw, n_remote,
+                                                 hidden16, partial16,
+                                                 swap_evict, swap_load, swap_k);
+    if (issue < 0) {
+        /* Send failed before any local work: plain full local compute. */
         if (ds4_gpu_begin_commands() == 0) return 0;
         const int rc = OFFLOAD_PASSTHROUGH();
         if (olog) {
-            uint64_t h1 = 0, m1 = 0;
-            ds4_gpu_stream_expert_cache_hitmiss(&h1, &m1);
+            uint8_t all_idx[DS4_OFFLOAD_N_USED];
+            for (uint32_t i = 0; i < n_expert; i++) all_idx[i] = (uint8_t)i;
+            offload_log_layer(olog, layer_index, ids16, (int)n_expert,
+                              all_idx, (int)n_expert, NULL, 0,
+                              0.0,
+                              ds4_gpu_stream_expert_cache_tail_misses() - slog_t0,
+                              1);
+        }
+        return rc;
+    }
+
+    /* Zero the remote experts' weights so the local kernel contributes only the
+     * resident experts (the worker supplies the remote partial). This does not
+     * depend on the partial, so enqueue and SUBMIT it now — the GPU runs it while
+     * we wait on the socket below. */
+    static ds4_gpu_tensor *partial_t;
+    if (!partial_t) {
+        partial_t = ds4_gpu_tensor_alloc((uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(float));
+        if (!partial_t) { if (ds4_gpu_begin_commands() == 0) return 0; return OFFLOAD_PASSTHROUGH(); }
+    }
+    float wz[DS4_OFFLOAD_N_USED];
+    memcpy(wz, w, (size_t)n_expert * sizeof(w[0]));
+    for (int i = 0; i < n_remote; i++) wz[remote_idx[i]] = 0.0f;
+    if (ds4_gpu_tensor_write((ds4_gpu_tensor *)weights, 0, wz,
+                             (uint64_t)n_expert * sizeof(float)) == 0) {
+        if (ds4_gpu_begin_commands() == 0) return 0;
+        return 0;
+    }
+    if (ds4_gpu_begin_commands() == 0) return 0;
+    /* Local resident experts only (remote weights zeroed). */
+    int rc = ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+        n_total_expert, n_expert, clamp, x, NULL, layer_index, force_resident);
+    if (rc == 0) return 0;
+    /* Submit the local compute so the GPU executes it during the collect wait
+     * (flush commits the current batch async and opens a fresh one). Only for the
+     * distributed path — loopback (issue==0) already has its partial. */
+    if (issue > 0 && ds4_gpu_flush_commands() == 0) return 0;
+
+    /* Block for the worker's partial — overlaps the GPU local compute above. */
+    const int collect_rc =
+        offload_collect_remote_partial(e, (int)layer_index, issue, partial16);
+    const double net_ms = olog ? (now_sec() - net_t0) * 1000.0 : 0.0;
+    if (collect_rc != 0) {
+        /* Worker dropped after the local-only compute was submitted. Recompute
+         * the FULL expert set locally (restore weights, overwrite out) so the
+         * residual is correct; skip the partial. Rare path. */
+        if (ds4_gpu_tensor_write((ds4_gpu_tensor *)weights, 0, w,
+                                 (uint64_t)n_expert * sizeof(w[0])) == 0) return 0;
+        rc = ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, clamp, x, NULL, layer_index, force_resident);
+        if (olog) {
             uint8_t all_idx[DS4_OFFLOAD_N_USED];
             for (uint32_t i = 0; i < n_expert; i++) all_idx[i] = (uint8_t)i;
             offload_log_layer(olog, layer_index, ids16, (int)n_expert,
@@ -21979,42 +22061,19 @@ static int metal_graph_routed_moe_or_offload(
         return rc;
     }
 
-    /* Zero the remote experts' weights so the local kernel contributes only the
-     * resident experts, and stage the worker's f16 partial as f32. The routed
-     * kernel's own add_in addend is honored only in a narrow fused variant (it is
-     * silently inert here), so the partial is added with an explicit GPU add
-     * queued right after the local compute. */
-    static ds4_gpu_tensor *partial_t;
-    if (!partial_t) {
-        partial_t = ds4_gpu_tensor_alloc((uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(float));
-        if (!partial_t) { if (ds4_gpu_begin_commands() == 0) return 0; return OFFLOAD_PASSTHROUGH(); }
-    }
+    /* Stage the worker's f16 partial as f32 and add it (queued into the current
+     * batch). The routed kernel's own add_in addend is inert here, so the
+     * partial is added with an explicit GPU add after the local compute. */
     float partf[DS4_OFFLOAD_N_EMBD];
     offload_f16_to_f32(partial16, partf, DS4_OFFLOAD_N_EMBD);
-    float wz[DS4_OFFLOAD_N_USED];
-    memcpy(wz, w, (size_t)n_expert * sizeof(w[0]));
-    for (int i = 0; i < n_remote; i++) wz[remote_idx[i]] = 0.0f;
     if (getenv("DS4_OFFLOAD_DEBUG")) {
         double pn = 0.0;
         for (uint32_t i = 0; i < DS4_OFFLOAD_N_EMBD; i++) pn += (double)partf[i] * partf[i];
         fprintf(stderr, "ds4:   L%u |partial|=%.4f n_remote=%d\n",
                 layer_index, sqrt(pn), n_remote);
     }
-    if (ds4_gpu_tensor_write(partial_t, 0, partf, (uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(float)) == 0 ||
-        ds4_gpu_tensor_write((ds4_gpu_tensor *)weights, 0, wz,
-                             (uint64_t)n_expert * sizeof(float)) == 0) {
-        if (ds4_gpu_begin_commands() == 0) return 0;
-        return 0;
-    }
-
-    if (ds4_gpu_begin_commands() == 0) return 0;
-    /* Local resident experts only (remote weights zeroed). */
-    int rc = ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size,
-        gate_offset, up_offset, down_offset, gate_type, down_type,
-        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-        expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-        n_total_expert, n_expert, clamp, x, NULL, layer_index, force_resident);
-    if (rc == 0) return 0;
+    if (ds4_gpu_tensor_write(partial_t, 0, partf,
+                             (uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(float)) == 0) return 0;
     /* out += worker's remote partial (queued GPU add, same command stream). */
     rc = ds4_gpu_add_tensor(out, out, partial_t, DS4_OFFLOAD_N_EMBD);
     if (olog) {
