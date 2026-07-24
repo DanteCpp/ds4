@@ -57333,7 +57333,16 @@ uint32_t ds4_engine_offload_decide(ds4_engine *e, uint64_t worker_avail_bytes,
     const uint32_t model_max =
         (uint32_t)DS4_OFFLOAD_N_LAYER * (uint32_t)DS4_OFFLOAD_N_ROUTED;
     uint32_t coord = offload_experts_for_bytes(e, offload_avail_bytes());
-    uint32_t worker = offload_experts_for_bytes(e, worker_avail_bytes);
+    /* Plan the worker tier a few percent BELOW its offer. The offer is measured
+     * at HELLO, but the worker re-checks a hard "90% of currently-available RAM"
+     * cap when it installs the plan seconds later — and by then it has faulted
+     * more of the mmap'd backbone in, so available RAM has drifted down. Without
+     * headroom a razor-thin overshoot (observed: 20.88 GiB planned vs a 20.85 GiB
+     * install-time cap, ~30 MiB) makes the worker reject the ENTIRE plan and the
+     * coordinator falls back to solo — no offload at all. ~3% headroom absorbs
+     * that drift; the handful of experts given up is negligible. */
+    const uint64_t worker_headroom = worker_avail_bytes / 32ull; /* ~3.1% */
+    uint32_t worker = offload_experts_for_bytes(e, worker_avail_bytes - worker_headroom);
     uint32_t env;
     if ((env = offload_env_experts("DS4_OFFLOAD_COORD_EXPERTS")) && env < coord)
         coord = env;
