@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -97,21 +98,6 @@ void ds4_offload_logf_file(ds4_offload_log *l, const char *fmt, ...) {
 
 /* Full read/write that survive short transfers and EINTR. Return 1 on success,
  * 0 on peer close or error. */
-static int off_write_full(int fd, const void *buf, size_t len) {
-    const char *p = (const char *)buf;
-    while (len > 0) {
-        ssize_t w = write(fd, p, len);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return 0;
-        }
-        if (w == 0) return 0;
-        p += w;
-        len -= (size_t)w;
-    }
-    return 1;
-}
-
 static int off_read_full(int fd, void *buf, size_t len) {
     char *p = (char *)buf;
     while (len > 0) {
@@ -226,14 +212,34 @@ static int off_dial(const char *host, int port, double timeout_sec,
 
 /* Frame I/O. Header on the wire: [ u32 len ][ u8 type ], then `len-1` payload
  * bytes. `len` counts the type byte plus the payload (§8). */
+/* Gathered write: emit the header and payload in ONE segment. Two separate
+ * write()s would, under TCP_NODELAY, put the 5-byte header on the wire as its
+ * own tiny packet ahead of the payload — an extra packet each way on every
+ * round trip. writev coalesces them, trimming that fixed per-frame overhead. */
+static int off_writev_full(int fd, struct iovec *iov, int iovcnt) {
+    while (iovcnt > 0) {
+        ssize_t w = writev(fd, iov, iovcnt);
+        if (w < 0) { if (errno == EINTR) continue; return 0; }
+        if (w == 0) return 0;
+        size_t adv = (size_t)w;
+        while (iovcnt > 0 && adv >= iov->iov_len) { adv -= iov->iov_len; iov++; iovcnt--; }
+        if (iovcnt > 0 && adv > 0) {
+            iov->iov_base = (char *)iov->iov_base + adv;
+            iov->iov_len -= adv;
+        }
+    }
+    return 1;
+}
+
 static int off_send_frame(int fd, uint8_t type, const void *payload, uint32_t bytes) {
     uint32_t len = bytes + 1;
     unsigned char head[5];
     memcpy(head, &len, 4);
     head[4] = type;
-    if (!off_write_full(fd, head, 5)) return 0;
-    if (bytes && !off_write_full(fd, payload, bytes)) return 0;
-    return 1;
+    struct iovec iov[2];
+    iov[0].iov_base = head;             iov[0].iov_len = 5;
+    iov[1].iov_base = (void *)payload;  iov[1].iov_len = bytes;
+    return off_writev_full(fd, iov, bytes ? 2 : 1);
 }
 
 /* Read a frame into `buf` (capacity `cap`). Returns payload length via *bytes
@@ -655,9 +661,10 @@ int ds4_offload_client_collect(ds4_offload_client *c, uint64_t seq,
  * Worker (expert compute server), §5.3.
  * --------------------------------------------------------------------- */
 
-/* Verbose per-request worker log (every EXPERT_REQ with ids/weights/timing).
- * The per-token aggregate line is always printed; set
- * DS4_OFFLOAD_WORKER_VERBOSE=1 for the full request stream. */
+/* Console verbosity. By default the console (stderr) shows ONE aggregate line
+ * per turn (a full response), while the session log file keeps the full
+ * per-token / per-request stream. Set DS4_OFFLOAD_WORKER_VERBOSE=1 to also
+ * mirror the per-request + per-token detail to the console. */
 static int off_worker_verbose(void) {
     static int v = -1;
     if (v < 0) {
@@ -665,6 +672,40 @@ static int off_worker_verbose(void) {
         v = (s && s[0] && s[0] != '0') ? 1 : 0;
     }
     return v;
+}
+
+/* Idle gap (ms) that separates one turn (a full response / generation) from the
+ * next. Inter-layer gaps are ~2-8 ms and inter-token gaps ~100-200 ms, so any
+ * pause longer than this marks the coordinator waiting for the next turn (user
+ * input / prompt ingest). Override with DS4_OFFLOAD_TURN_GAP_MS. */
+static double off_turn_gap_ms(void) {
+    static double g = -1.0;
+    if (g < 0.0) {
+        const char *s = getenv("DS4_OFFLOAD_TURN_GAP_MS");
+        g = (s && s[0]) ? atof(s) : 1500.0;
+        if (g < 1.0) g = 1500.0;
+    }
+    return g;
+}
+
+/* Per-turn aggregation for the CONSOLE log: sums the per-token aggregates over a
+ * whole response so stderr gets one concise line per turn instead of one per
+ * token. The verbose per-token / per-request stream still goes to the file. */
+typedef struct {
+    uint64_t turn_no;
+    int open;
+    int tokens;                                /* tokens folded into this turn */
+    int layers;                                /* summed EXPERT_REQs           */
+    int experts;                               /* summed experts executed      */
+    int errors;                                /* summed compute failures      */
+    int evict_hints;                           /* summed swap hints            */
+    double compute_ms;                         /* summed GPU compute time      */
+    double wall0_ms;                           /* first request of the turn    */
+    double wall_last_ms;                       /* last request of the turn     */
+} off_turn_agg;
+
+static void off_turn_agg_init(off_turn_agg *t) {
+    memset(t, 0, sizeof(*t));
 }
 
 /* Per-token aggregation for the worker's live compute log. One token = one
@@ -695,22 +736,16 @@ static void off_tok_agg_init(off_tok_agg *a) {
 }
 
 static void off_tok_agg_flush(off_tok_agg *a,
-                              const ds4_offload_worker_options *opt) {
+                              const ds4_offload_worker_options *opt,
+                              off_turn_agg *turn) {
     if (!a->open) return;
     const double wall_ms = off_now_ms() - a->wall0_ms;
     char diag[192] = "";
     if (opt->diag) opt->diag(opt->user, diag, sizeof(diag));
-    fprintf(stderr,
-            "ds4-offload: tok#%llu done: %d layer-reqs, %d experts, "
-            "compute %.2f ms (%.2f ms/layer), wall %.2f ms, "
-            "errors=%d, evict-hints=%d%s%s\n",
-            (unsigned long long)a->tok_no, a->layers, a->experts,
-            a->compute_ms,
-            a->layers > 0 ? a->compute_ms / a->layers : 0.0,
-            wall_ms, a->errors, a->evict_hints,
-            diag[0] ? " | " : "", diag);
+    /* Per-token line is FILE-ONLY now (ds4_offload_logf_file does not echo to
+     * stderr); the console gets the coarser per-turn summary instead. */
     if (opt->log) {
-        ds4_offload_logf(opt->log,
+        ds4_offload_logf_file(opt->log,
             "tok#%llu done: %d layer-reqs, %d experts, compute %.2f ms "
             "(%.2f ms/layer), wall %.2f ms, errors=%d, evict-hints=%d%s%s",
             (unsigned long long)a->tok_no, a->layers, a->experts,
@@ -745,9 +780,46 @@ static void off_tok_agg_flush(off_tok_agg *a,
         }
         fprintf(stderr, "\n");
     }
+    /* Fold this token into the current turn (the console summary). */
+    if (turn) {
+        turn->tokens++;
+        turn->layers      += a->layers;
+        turn->experts     += a->experts;
+        turn->errors      += a->errors;
+        turn->evict_hints += a->evict_hints;
+        turn->compute_ms  += a->compute_ms;
+    }
     const uint64_t next = a->tok_no + 1;
     off_tok_agg_init(a);
     a->tok_no = next;
+}
+
+/* Console (and file) per-turn summary: one line for a whole response. Printed on
+ * a turn boundary (idle gap) and at disconnect. */
+static void off_turn_agg_flush(off_turn_agg *t,
+                               const ds4_offload_worker_options *opt) {
+    if (!t->open) return;
+    const double wall_ms = t->wall_last_ms - t->wall0_ms;
+    char diag[192] = "";
+    if (opt->diag) opt->diag(opt->user, diag, sizeof(diag));
+    fprintf(stderr,
+            "ds4-offload: turn#%llu done: %d tokens, %d layer-reqs, %d experts, "
+            "compute %.2f ms (%.2f ms/tok), wall %.2f ms, errors=%d, "
+            "evict-hints=%d%s%s\n",
+            (unsigned long long)t->turn_no, t->tokens, t->layers, t->experts,
+            t->compute_ms, t->tokens > 0 ? t->compute_ms / t->tokens : 0.0,
+            wall_ms, t->errors, t->evict_hints, diag[0] ? " | " : "", diag);
+    /* File marker (file-only; the per-token/per-request detail already logged). */
+    if (opt->log)
+        ds4_offload_logf_file(opt->log,
+            "turn#%llu done: %d tokens, %d layer-reqs, %d experts, compute "
+            "%.2f ms (%.2f ms/tok), wall %.2f ms, errors=%d, evict-hints=%d%s%s",
+            (unsigned long long)t->turn_no, t->tokens, t->layers, t->experts,
+            t->compute_ms, t->tokens > 0 ? t->compute_ms / t->tokens : 0.0,
+            wall_ms, t->errors, t->evict_hints, diag[0] ? " | " : "", diag);
+    const uint64_t next = t->turn_no + 1;
+    off_turn_agg_init(t);
+    t->turn_no = next;
 }
 
 int ds4_offload_expert_compute_zero(void *user, int layer,
@@ -882,10 +954,13 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                     (double)wired / (1024.0 * 1024.0 * 1024.0));
         }
 
-        /* Per-token aggregation state + session totals (reset per coordinator
-         * connection so the token numbering matches this session). */
+        /* Per-token / per-turn aggregation state + session totals (reset per
+         * coordinator connection so the numbering matches this session). */
         off_tok_agg agg;
         off_tok_agg_init(&agg);
+        off_turn_agg turn;
+        off_turn_agg_init(&turn);
+        double last_req_ms = -1.0;      /* wall time of the previous request  */
         uint64_t sess_reqs = 0, sess_experts = 0;
         double sess_compute_ms = 0.0;
 
@@ -964,15 +1039,26 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
                         compute_ms, compute_rc == 0 ? "ok" : "ERROR");
             }
 
-            /* Aggregate into the current token. A non-increasing layer id
-             * means the coordinator started the next token: flush first. */
+            /* Aggregate into the current token/turn. A non-increasing layer id
+             * closes the token; a long idle gap since the previous request
+             * closes the turn (a new response begins) and emits the console
+             * summary. */
             if (layer >= 0 && layer < DS4_OFFLOAD_N_LAYER) {
-                if (agg.open && layer <= agg.prev_layer)
-                    off_tok_agg_flush(&agg, opt);
+                const double gap = (last_req_ms >= 0.0)
+                                   ? (compute_t0 - last_req_ms) : 0.0;
+                const int turn_boundary =
+                    (last_req_ms >= 0.0 && gap > off_turn_gap_ms());
+                if (agg.open && (layer <= agg.prev_layer || turn_boundary))
+                    off_tok_agg_flush(&agg, opt, &turn);
+                if (turn_boundary)
+                    off_turn_agg_flush(&turn, opt);
+                if (!turn.open) { turn.open = 1; turn.wall0_ms = compute_t0; }
+                turn.wall_last_ms = compute_t0;
                 if (!agg.open) {
                     agg.open = 1;
                     agg.wall0_ms = compute_t0;
                 }
+                last_req_ms = compute_t0;
                 agg.layers++;
                 agg.experts += k;
                 agg.errors += (compute_rc != 0);
@@ -1005,7 +1091,8 @@ int ds4_offload_worker_run(const ds4_offload_worker_options *opt,
             }
         }
 
-        off_tok_agg_flush(&agg, opt);
+        off_tok_agg_flush(&agg, opt, &turn);
+        off_turn_agg_flush(&turn, opt);
         fprintf(stderr,
                 "ds4-offload: session totals: %llu tokens, %llu layer-reqs, "
                 "%llu experts, compute %.2f ms total%s\n",
