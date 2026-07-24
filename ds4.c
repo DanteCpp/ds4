@@ -21894,7 +21894,8 @@ static int metal_graph_routed_moe_or_offload(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
-        uint32_t layer_index, bool force_resident) {
+        uint32_t layer_index, bool force_resident,
+        bool router_readback_done) {
     ds4_engine *e = g_offload_engine;
 #define OFFLOAD_PASSTHROUGH() \
     ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size, \
@@ -21902,6 +21903,11 @@ static int metal_graph_routed_moe_or_offload(
         gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes, \
         expert_in_dim, expert_mid_dim, out_dim, selected, weights, \
         n_total_expert, n_expert, clamp, x, add_in, layer_index, force_resident)
+/* Open a command batch only if one is not already active. In the selected/shared
+ * overlap path (router_readback_done) the caller left a batch open with the
+ * shared expert still in flight, so we must NOT begin a fresh one. */
+#define OFFLOAD_ENSURE_BATCH() \
+    (ds4_gpu_commands_active() ? 1 : ds4_gpu_begin_commands())
 
     /* Only the plain routed path (no pre-existing addend) of the DeepSeek-V4-Flash
      * geometry is offloaded; anything else, or offload inactive, is the untouched
@@ -21922,9 +21928,17 @@ static int metal_graph_routed_moe_or_offload(
         slog_t0 = ds4_gpu_stream_expert_cache_tail_misses();
     }
 
-    /* Commit pending work so the router selection + normalized hidden are
-     * host-readable (same sync the CPU-router path performs). */
-    if (ds4_gpu_end_commands() == 0) return OFFLOAD_PASSTHROUGH();
+    /* Make the router selection + normalized hidden host-readable. Normally we
+     * drain the GPU (end_commands). But in the selected/shared overlap path the
+     * caller already waited ONLY the router readback event
+     * (commit_and_wait_selected_readback) and left the shared expert's command
+     * buffer IN FLIGHT — a full drain here would wait for it and destroy the
+     * overlap. In that case the router/weights/hidden are already complete, so
+     * we skip the drain and read them directly, letting the shared expert run
+     * concurrently with the worker round trip (and any local SSD reads) below. */
+    if (!router_readback_done) {
+        if (ds4_gpu_end_commands() == 0) return OFFLOAD_PASSTHROUGH();
+    }
 
     int32_t sel[DS4_OFFLOAD_N_USED];
     float   w[DS4_OFFLOAD_N_USED];
@@ -21932,7 +21946,7 @@ static int metal_graph_routed_moe_or_offload(
     if (ds4_gpu_tensor_read(selected, 0, sel, (uint64_t)n_expert * sizeof(sel[0])) == 0 ||
         ds4_gpu_tensor_read(weights, 0, w, (uint64_t)n_expert * sizeof(w[0])) == 0 ||
         ds4_gpu_tensor_read(x, 0, norm, (uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(norm[0])) == 0) {
-        if (ds4_gpu_begin_commands() == 0) return 0;
+        if (OFFLOAD_ENSURE_BATCH() == 0) return 0;
         return OFFLOAD_PASSTHROUGH();
     }
 
@@ -21980,7 +21994,7 @@ static int metal_graph_routed_moe_or_offload(
     }
 
     if (n_remote == 0) {          /* all experts resident: plain local compute */
-        if (ds4_gpu_begin_commands() == 0) return 0;
+        if (OFFLOAD_ENSURE_BATCH() == 0) return 0;
         const int rc = OFFLOAD_PASSTHROUGH();
         if (olog) {
             uint64_t h1 = 0, m1 = 0;
@@ -22043,7 +22057,7 @@ static int metal_graph_routed_moe_or_offload(
                                                  swap_evict, swap_load, swap_k);
     if (issue < 0) {
         /* Send failed before any local work: plain full local compute. */
-        if (ds4_gpu_begin_commands() == 0) return 0;
+        if (OFFLOAD_ENSURE_BATCH() == 0) return 0;
         const int rc = OFFLOAD_PASSTHROUGH();
         if (olog) {
             uint8_t all_idx[DS4_OFFLOAD_N_USED];
@@ -22064,17 +22078,17 @@ static int metal_graph_routed_moe_or_offload(
     static ds4_gpu_tensor *partial_t;
     if (!partial_t) {
         partial_t = ds4_gpu_tensor_alloc((uint64_t)DS4_OFFLOAD_N_EMBD * sizeof(float));
-        if (!partial_t) { if (ds4_gpu_begin_commands() == 0) return 0; return OFFLOAD_PASSTHROUGH(); }
+        if (!partial_t) { if (OFFLOAD_ENSURE_BATCH() == 0) return 0; return OFFLOAD_PASSTHROUGH(); }
     }
     float wz[DS4_OFFLOAD_N_USED];
     memcpy(wz, w, (size_t)n_expert * sizeof(w[0]));
     for (int i = 0; i < n_remote; i++) wz[remote_idx[i]] = 0.0f;
     if (ds4_gpu_tensor_write((ds4_gpu_tensor *)weights, 0, wz,
                              (uint64_t)n_expert * sizeof(float)) == 0) {
-        if (ds4_gpu_begin_commands() == 0) return 0;
+        if (OFFLOAD_ENSURE_BATCH() == 0) return 0;
         return 0;
     }
-    if (ds4_gpu_begin_commands() == 0) return 0;
+    if (OFFLOAD_ENSURE_BATCH() == 0) return 0;
     /* Local resident experts only (remote weights zeroed). */
     int rc = ds4_gpu_routed_moe_one_tensor(out, gate, up, mid, experts, model_map, model_size,
         gate_offset, up_offset, down_offset, gate_type, down_type,
@@ -24025,7 +24039,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                      NULL,
                                                      il,
-                                                     false) != 0;
+                                                     false, /*router_readback_done=*/false) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
@@ -24231,7 +24245,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                      NULL,
                                                      il,
-                                                     false) != 0;
+                                                     false, /*router_readback_done=*/true) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) ds4_offload_selftest_capture(metal_graph_routed_out(g), metal_graph_router_selected(g),
                                              metal_graph_router_weights(g), metal_graph_ffn_norm(g), (int)il);
@@ -24325,7 +24339,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                  NULL,
                                                  il,
-                                                 false) != 0;
+                                                 false, /*router_readback_done=*/false) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) ds4_offload_selftest_capture(metal_graph_routed_out(g), metal_graph_router_selected(g),
                                          metal_graph_router_weights(g), metal_graph_ffn_norm(g), (int)il);
