@@ -21762,6 +21762,54 @@ static void offload_commit_swaps(ds4_engine *e, int layer,
     }
 }
 
+/* Drop swaps the worker would NOT apply against the coordinator's CURRENT
+ * residency belief — mirroring the worker's guard (load already on worker ->
+ * no-op; evict not on worker -> refuse) and accounting for earlier swaps in the
+ * same batch via a tiny in-batch shadow. Compacts swap_evict/swap_load in place
+ * and returns the surviving count.
+ *
+ * This is the send-side twin of offload_commit_swaps: the batch planned/queued
+ * by offload_plan_swap can go stale (a deferred swap's evict target may already
+ * have moved local by the time it drains), and sending those to the worker made
+ * it fail every one ("evict target not resident") and flood stderr — thousands
+ * of wasted swaps. Filtering here means the worker receives ONLY swaps it will
+ * actually apply, so send == commit == worker-apply, exactly. */
+static int offload_filter_swaps(ds4_engine *e, int layer,
+                                uint16_t *swap_evict, uint16_t *swap_load, int swap_k) {
+    const ds4_offload_residency *res = ds4_engine_offload_residency(e);
+    if (!res) return 0;
+    /* In-batch shadow: local[x]==1 means expert x is coordinator-local (NOT on
+     * the worker). At most 2 entries per swap; <=6 swaps -> tiny. */
+    uint16_t chg_x[DS4_OFFLOAD_N_USED * 2];
+    uint8_t  chg_local[DS4_OFFLOAD_N_USED * 2];
+    int nchg = 0, out = 0;
+    for (int i = 0; i < swap_k; i++) {
+        const int E = (int)swap_evict[i], Z = (int)swap_load[i];
+        if (E < 0 || E >= DS4_OFFLOAD_N_ROUTED ||
+            Z < 0 || Z >= DS4_OFFLOAD_N_ROUTED) continue;
+        int z_local = ds4_offload_residency_get(res, layer, Z);
+        int e_local = ds4_offload_residency_get(res, layer, E);
+        for (int j = 0; j < nchg; j++) {
+            if (chg_x[j] == (uint16_t)Z) z_local = chg_local[j];
+            if (chg_x[j] == (uint16_t)E) e_local = chg_local[j];
+        }
+        if (!z_local) continue;   /* load already on worker -> worker no-ops */
+        if (e_local) continue;    /* evict not on worker -> worker refuses  */
+        /* Applies: Z -> worker (local=0), E -> local (1). Record in the shadow. */
+        int fz = 0, fe = 0;
+        for (int j = 0; j < nchg; j++) {
+            if (chg_x[j] == (uint16_t)Z) { chg_local[j] = 0; fz = 1; }
+            if (chg_x[j] == (uint16_t)E) { chg_local[j] = 1; fe = 1; }
+        }
+        if (!fz) { chg_x[nchg] = (uint16_t)Z; chg_local[nchg] = 0; nchg++; }
+        if (!fe) { chg_x[nchg] = (uint16_t)E; chg_local[nchg] = 1; nchg++; }
+        swap_evict[out] = (uint16_t)E;
+        swap_load[out]  = (uint16_t)Z;
+        out++;
+    }
+    return out;
+}
+
 /* Coordinator session log: per-layer serving origin and per-token summaries.
  * One token = one increasing run of layer indices through the decode splice;
  * a wrap flushes the previous token. Per layer we record which experts were
@@ -21975,6 +22023,11 @@ static int metal_graph_routed_moe_or_offload(
             break;  /* swap_evict/load full; remainder stays queued */
         }
     }
+
+    /* Send only the swaps the worker will actually apply against our current
+     * belief (drop stale deferred ones whose evict target already moved local),
+     * so send == commit == worker-apply and the worker never fails a swap. */
+    swap_k = offload_filter_swaps(e, (int)layer_index, swap_evict, swap_load, swap_k);
 
     uint16_t partial16[DS4_OFFLOAD_N_EMBD];
     const double net_t0 = olog ? now_sec() : 0.0;
